@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::str::Lines;
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::NaiveDateTime;
 use regex::Regex;
 use thiserror::Error;
 use zip::result::ZipError;
@@ -100,14 +100,14 @@ enum SubmissionError {
     #[error("failed to write a submitted file for Student '{student}' (attempt {attempt}):\n{detail}")]
     IOWrite {
         student: String,
-        attempt: DateTime<Local>,
+        attempt: NaiveDateTime,
         detail: io::Error,
     },
 
     #[error("failed to unzip a submitted zip for {student} (attempt {attempt}):\n{detail}")]
     Extract {
         student: String,
-        attempt: DateTime<Local>,
+        attempt: NaiveDateTime,
         detail: ZipError,
     },
 }
@@ -116,14 +116,14 @@ impl SubmissionError {
     /// Wraps an [`io::Error`] with additional submission-related information to create a [`SubmissionError`].
     pub fn from_io(submission: &Submission, detail: io::Error) -> Self {
         let student = submission.fullname.to_string();
-        let attempt = submission.datetime.into();
+        let attempt = submission.datetime;
         Self::IOWrite { student, attempt, detail }
     }
 
     /// Wraps a [`ZipError`] with additional submission-related information to create a [`SubmissionError`].
     pub fn from_zip(submission: &Submission, detail: ZipError) -> Self {
         let student = submission.fullname.to_string();
-        let attempt = submission.datetime.into();
+        let attempt = submission.datetime;
         Self::Extract { student, attempt, detail }
     }
 }
@@ -390,7 +390,7 @@ struct Submission<'a> {
     /// The name of the assignment this submission belongs to.
     pub assn_name: &'a str,
     /// When this assignment was submitted.
-    pub datetime: DateTime<Utc>,
+    pub datetime: NaiveDateTime,
     /// Any text that the student provided in the "Text Submission" field on Blackboard's interface.
     pub text_submission: Option<&'a str>,
     /// Any comments provided by the student when submitting.
@@ -425,9 +425,7 @@ impl<'a> Submission<'a> {
             } else if line.starts_with("Date Submitted:") {
                 const START: usize = "Date Submitted:".len();
                 let sub_date = line[START..].trim();
-                let sub_date = DateTime::parse_from_str(sub_date, SUBMISSION_DATE_FORMAT)
-                    .expect("Blackboard submission 'txt' should have a fully formatted datetime in its 'Date Submitted' line")
-                    .into();
+                let sub_date = NaiveDateTime::parse_from_str(sub_date, SUBMISSION_DATE_FORMAT).unwrap();
                 datetime = Some(sub_date);
             } else if line.trim() == "Submission Field:" {
                 let section_text = read_section_until(&mut lines, &["Comments:", "Files:"]).trim();
