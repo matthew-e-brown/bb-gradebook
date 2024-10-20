@@ -1,14 +1,13 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek};
+use std::io::{self, Cursor, Read, Seek};
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::Lines;
 use std::sync::LazyLock;
-use std::{env, io};
 
 use chrono::NaiveDateTime;
 use regex::Regex;
@@ -42,9 +41,29 @@ Parameters:
                     shortened 'firstnamelastname' usernames.
 ";
 
+/// The format specifier for parsing datetimes out of the Blackboard `.txt` datafiles' "Date submitted:" lines.
+///
+/// Quick reference:
+/// - `%A`: full weekday name.
+/// - `%B`: full month name.
+/// - `%-d`: day number, with modifier to ignore zero-padding.
+/// - `%Y`: full year number, zero-padded to four digits.
+/// - `%-I`: hour number, 12 hours, with non-zero-padded modifier.
+/// - `%M`: minute number, zero-padded.
+/// - `%S`: second number, zero-padded.
+/// - `%p`: uppercase AM/PM.
+/// - `%Z`: local timezone name (e.g. EST).
+///
+/// Full reference: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
 const SUBMISSION_DATE_FORMAT: &'static str = "%A, %B %-d, %Y %-I:%M:%S %p %Z";
+
+/// The text used to denote "no text submissions for this assignment", since Blackboard doesn't actually leave the field
+/// empty.
 const EMPTY_SUBMISSION_FIELD: &'static str = "There is no student submission text data for this assignment.";
+
+/// The text used to denote "no comments for this assignment", since Blackboard doesn't actually leave the field empty.
 const EMPTY_COMMENTS_FIELD: &'static str = "There are no student comments for this assignment.";
+
 
 /// Regex used to find the `.txt` files that Blackboard uses to document each student submission inside of a gradebook.
 ///
@@ -62,6 +81,7 @@ static STUDENT_NAME_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z]+)\)$").unwrap());
 
 
+/// An error that may occur when attempting to open or extract data from a gradebook.
 #[derive(Debug, Error)]
 enum GradebookError {
     #[error("could not read gradebook file: {0}")]
@@ -74,6 +94,7 @@ enum GradebookError {
     Empty,
 }
 
+/// An error that may occur when attempting to parse or extract an individual submission.
 #[derive(Debug, Error)]
 enum SubmissionError {
     #[error("failed to write a submitted file for Student '{student}' (attempt {attempt}):\n{detail}")]
@@ -92,12 +113,14 @@ enum SubmissionError {
 }
 
 impl SubmissionError {
+    /// Wraps an [`io::Error`] with additional submission-related information to create a [`SubmissionError`].
     pub fn from_io(submission: &Submission, detail: io::Error) -> Self {
         let student = submission.fullname.to_string();
         let attempt = submission.datetime;
         Self::IOWrite { student, attempt, detail }
     }
 
+    /// Wraps a [`ZipError`] with additional submission-related information to create a [`SubmissionError`].
     pub fn from_zip(submission: &Submission, detail: ZipError) -> Self {
         let student = submission.fullname.to_string();
         let attempt = submission.datetime;
@@ -163,7 +186,7 @@ fn main() -> ExitCode {
     }
 }
 
-
+/// Reads, parses, and extracts all of the contents of a Blackboard gradebook into directories on disk.
 fn process_gradebook(
     archive_path: &str,
     out_directory: Option<&str>,
@@ -228,11 +251,8 @@ fn process_gradebook(
         })
         .collect::<Vec<_>>();
 
-    submissions.sort_by(|a, b| match a.username.cmp(b.username) {
-        Ordering::Equal => a.datetime.cmp(&b.datetime),
-        unequal => unequal,
-    });
-
+    // Sort the submissions by username, then by datetime; that way we can number their attempts.
+    submissions.sort_unstable_by(|a, b| a.username.cmp(b.username).then_with(|| a.datetime.cmp(&b.datetime)));
 
     // Onto processing!
     // --------------------------------------------------------------------------------------------
@@ -277,7 +297,7 @@ fn process_gradebook(
     Ok(results)
 }
 
-
+/// Extracts and writes a single [`Submission`]'s files to disk.
 fn process_submission(
     gradebook: &mut ZipArchive<impl Read + Seek>,
     submission: Submission,
@@ -358,19 +378,29 @@ fn process_submission(
 }
 
 
+/// Metadata for a single assignment submission.
 #[derive(Debug)]
 struct Submission<'a> {
+    /// The name of the Blackboard `.txt` metadata file that this submission was parsed from.
     pub datafile_name: &'a str,
+    /// The full name of the student who submitted this assignment.
     pub fullname: &'a str,
+    /// The username of the student who submitted this assignment.
     pub username: &'a str,
+    /// The name of the assignment this submission belongs to.
     pub assn_name: &'a str,
+    /// When this assignment was submitted.
     pub datetime: NaiveDateTime,
+    /// Any text that the student provided in the "Text Submission" field on Blackboard's interface.
     pub text_submission: Option<&'a str>,
+    /// Any comments provided by the student when submitting.
     pub comments: Option<&'a str>,
+    /// A list of metadata for all of the files attached to this submission.
     pub files: Vec<SubmissionFile<'a>>,
 }
 
 impl<'a> Submission<'a> {
+    /// Parses a Blackboard `.txt` datafile and extracts all metadata about its submission.
     pub fn new(datafile_name: &'a str, contents: &'a str) -> Self {
         let mut lines = contents.lines().peekable(); // Section reading depends on being peekable
 
@@ -429,14 +459,17 @@ impl<'a> Submission<'a> {
     }
 }
 
-
+/// Metadata for a single file as part of a larger assignment submission.
 #[derive(Debug)]
 struct SubmissionFile<'a> {
+    /// The original name of the file, as uploaded by the student.
     pub original_name: &'a str,
+    /// The name of the file in the Blackboard gradebook zip file.
     pub archive_name: &'a str,
 }
 
 impl<'a> SubmissionFile<'a> {
+    /// Borrows from the iterator used by [`Submission::new`] to consume all lines related to files
     pub fn new(lines: &mut Lines<'a>) -> Option<Self> {
         let mut original_name = None;
         let mut archive_name = None;
@@ -464,7 +497,7 @@ impl<'a> SubmissionFile<'a> {
     }
 }
 
-
+/// Reads a section of a Blackboard `.txt` datafile up until one of a specified set of lines is reached.
 fn read_section_until<'a>(lines: &mut Peekable<Lines<'a>>, stop_at: &[&str]) -> &'a str {
     let mut ptr_start = None;
     let mut ptr_end = None;
