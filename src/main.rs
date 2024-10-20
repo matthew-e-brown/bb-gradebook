@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek};
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::Lines;
@@ -190,9 +191,6 @@ fn process_gradebook(
 
     println!("Parsing submission data...");
 
-    // Capture groups are just there for explanatory purposes (date is 'YYYY-MM-DD-hh-mm-ss' format). We get the actual
-    // assignment and student names from
-
     // We need to allocate and collect the filenames first because pulling the actual files out of the archive requires
     // a mutable reference to the archive, but the iterators holds an immutable one.
     let datafile_names = gradebook
@@ -375,7 +373,7 @@ struct Submission<'a> {
 
 impl<'a> Submission<'a> {
     pub fn new(datafile_name: &'a str, contents: &'a str) -> Self {
-        let mut lines = contents.lines();
+        let mut lines = contents.lines().peekable(); // Section reading depends on being peekable
 
         let mut fullname = None;
         let mut username = None;
@@ -401,17 +399,17 @@ impl<'a> Submission<'a> {
                 let sub_date = NaiveDateTime::parse_from_str(sub_date, SUBMISSION_DATE_FORMAT).unwrap();
                 datetime = Some(sub_date);
             } else if line.trim() == "Submission Field:" {
-                let section_text = read_section_until(lines.by_ref(), &["Comments:", "Files:"]).trim();
+                let section_text = read_section_until(&mut lines, &["Comments:", "Files:"]).trim();
                 if section_text != EMPTY_SUBMISSION_FIELD {
                     text_submission = Some(section_text);
                 }
             } else if line.trim() == "Comments:" {
-                let section_text = read_section_until(lines.by_ref(), &["Submission Field:", "Files:"]).trim();
+                let section_text = read_section_until(&mut lines, &["Submission Field:", "Files:"]).trim();
                 if section_text != EMPTY_COMMENTS_FIELD {
                     comments = Some(section_text);
                 }
             } else if line.trim() == "Files:" {
-                let section_text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]);
+                let section_text = read_section_until(&mut lines, &["Submission Field:", "Comments:"]);
                 let mut file_lines = section_text.lines();
                 while let Some(file) = SubmissionFile::new(&mut file_lines) {
                     files.push(file);
@@ -468,30 +466,34 @@ impl<'a> SubmissionFile<'a> {
 }
 
 
-fn read_section_until<'a>(lines: &mut Lines<'a>, stop_at: &[&str]) -> &'a str {
-    // Get the first line and the address that it starts ats
-    let first_line = lines.next().expect("section should have at least one line");
-    let section_start = first_line.as_ptr();
-    let mut section_end = section_start; // track the range of all lines
+fn read_section_until<'a>(lines: &mut Peekable<Lines<'a>>, stop_at: &[&str]) -> &'a str {
+    let mut ptr_start = None;
+    let mut ptr_end = None;
 
-    // Start peeking forwards...
-    let mut lines = lines.peekable();
+    let should_stop = |line: &str| stop_at.iter().any(|&stop| line.trim() == stop);
 
-    // ...as long as the next line is not 'Comments:' or 'Files:' (or whatever else was passed)...
-    while lines
-        .peek()
-        .is_some_and(|line| !stop_at.iter().any(|&stop| line.trim() == stop))
-    {
-        // ...tick our 'end' pointer forward to the end of each line
+    while lines.peek().is_some_and(|line| !should_stop(line)) {
         let line = lines.next().unwrap();
-        section_end = line.as_bytes().as_ptr_range().end;
+        let ptrs = line.as_bytes().as_ptr_range();
+
+        // Only set start pointer if this is the first line we've read.
+        if ptr_start.is_none() {
+            ptr_start = Some(ptrs.start);
+        }
+
+        // Always advance end pointer.
+        ptr_end = Some(ptrs.end);
     }
 
-    // SAFETY: all involved pointers are derived from already-valid UTF-8 strings; all of those strings come from the
-    // same `Lines` iterator, so they're all from the same `String`.
-    unsafe {
-        let size = section_end.offset_from(section_start) as usize;
-        let slice = std::slice::from_raw_parts(section_start, size);
-        std::str::from_utf8_unchecked(slice)
+    match (ptr_start, ptr_end) {
+        // SAFETY: all involved pointers are derived from already-valid UTF-8 strings; all of those strings come from
+        // the same `Lines` iterator, so they're all from the same `String`.
+        (Some(start), Some(end)) => unsafe {
+            let size = end.offset_from(start) as usize; // end > start, cast should never truncate
+            let slice = std::slice::from_raw_parts(start, size);
+            std::str::from_utf8_unchecked(slice)
+        },
+        (None, None) => "",
+        _ => unreachable!("either both pointers should be set or neither should be set"),
     }
 }
