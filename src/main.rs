@@ -7,10 +7,10 @@ use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::Lines;
+use std::sync::LazyLock;
 use std::{env, io};
 
 use chrono::NaiveDateTime;
-use lazy_static::lazy_static;
 use regex::Regex;
 use thiserror::Error;
 use zip::result::ZipError;
@@ -46,21 +46,20 @@ const SUBMISSION_DATE_FORMAT: &'static str = "%A, %B %-d, %Y %-I:%M:%S %p %Z";
 const EMPTY_SUBMISSION_FIELD: &'static str = "There is no student submission text data for this assignment.";
 const EMPTY_COMMENTS_FIELD: &'static str = "There are no student comments for this assignment.";
 
-lazy_static! {
-    // This regex is used to find the `.txt` files that Blackboard uses to document each student submission inside a
-    // gradebook.
-    //
-    // It ensures that the '.txt' appears right after the `attempt_TIMESTAMP` portion of the filename. So it won't catch
-    // any student-submitted '.txt' files, unless they submitted one that happened to have `_attempt_TIMESTAMP` right at
-    // the end, which is unlikely.
-    //
-    // The date format at the end is `YYYY-MM-DD-hh-mm-ss`.
-    static ref SUBMISSION_FILE_REGEX: Regex = Regex::new(r"^.+?_[a-z]+_attempt_\d{4}(?:-\d\d){5}\.txt$").unwrap();
+/// Regex used to find the `.txt` files that Blackboard uses to document each student submission inside of a gradebook.
+///
+/// This regex ensures that the '.txt' appears right after the `attempt_<TIMESTAMP>` portion of the filename, so it
+/// shouldn't ever catch any student-submitted '.txt' files (unless they submitted one that happened to have
+/// `_attempt_TIMESTAMP` right at the end, which is unlikely).
+///
+/// The date format at the end is `YYYY-MM-DD-hh-mm-ss`.
+static SUBMISSION_FILE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^.+?_[a-z]+_attempt_\d{4}(?:-\d\d){5}\.txt$").unwrap());
 
-    // This regex is used to extract a student's full name and username at the same time, since we can't just rely on
-    // reading to the end of the line.
-    static ref STUDENT_NAME_REGEX: Regex = Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z]+)\)$").unwrap();
-}
+/// Regex used to extract a student's full name and username at the same time, since we can't just rely on reading to
+/// the end of the line.
+static STUDENT_NAME_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z]+)\)$").unwrap());
 
 
 #[derive(Debug, Error)]
