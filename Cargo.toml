@@ -1,5 +1,7 @@
 [package]
 name = "bb-gradebook"
+description = "Neatly extracts student submissions from zip files downloaded from Blackboard."
+authors = ["Matthew Brown <matthew.e.brown.17@gmail.com>"]
 version = "0.1.1"
 edition = "2021"
 
