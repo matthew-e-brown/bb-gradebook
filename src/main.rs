@@ -73,12 +73,12 @@ const EMPTY_COMMENTS_FIELD: &'static str = "There are no student comments for th
 ///
 /// The date format at the end is `YYYY-MM-DD-hh-mm-ss`.
 static SUBMISSION_FILE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^.+?_[a-z]+_attempt_\d{4}(?:-\d\d){5}\.txt$").unwrap());
+    LazyLock::new(|| Regex::new(r"^.+?_[a-z0-9_]+_attempt_\d{4}(?:-\d\d){5}\.txt$").unwrap());
 
 /// Regex used to extract a student's full name and username at the same time, since we can't just rely on reading to
 /// the end of the line.
 static STUDENT_NAME_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z]+)\)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z0-9_]+)\)$").unwrap());
 
 
 /// An error that may occur when attempting to open or extract data from a gradebook.
