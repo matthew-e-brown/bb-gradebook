@@ -188,45 +188,70 @@ impl Submission {
         let mut datetime = None;
         let mut text_sub = None;
         let mut comments = None;
-        let mut files = Vec::new();
+        let mut files = None;
 
         let mut lines = datafile_contents.lines().peekable();
         while let Some(line) = lines.next() {
-            if line.starts_with("Name:") {
-                let captures = STUDENT_NAME_REGEX
-                    .captures(line)
-                    .ok_or_else(|| /*TODO*/ "Malformed 'txt' datafile")?;
-                // Can unwrap capture groups because the regex is strict enough that either the groups are there or the
-                // entire thing would have failed:
-                let fullname = captures.name("fullname").unwrap().as_str().to_owned().into_boxed_str();
-                let username = captures.name("username").unwrap().as_str().to_owned().into_boxed_str();
-                set_if_none!("Name", student_fullname, fullname);
-                set_if_none!("Name", student_username, username);
-            } else if line.starts_with("Date Submitted:") {
-                let date_substr = line["Date Submitted:".len()..].trim();
-                let date_parsed = NaiveDateTime::parse_from_str(date_substr, SUBMISSION_DATE_FORMAT)
-                    .map_err(|_| "Malformed date in 'txt' datafile")?;
-                set_if_none!("Date Submitted", datetime, date_parsed);
-            } else if line.trim() == "Submission Field:" {
-                let section_text = read_section_until(lines.by_ref(), &["Comments:", "Files:"]).trim();
-                if section_text != EMPTY_SUBMISSION_FIELD {
-                    set_if_none!("Submission Field", text_sub, section_text.to_owned());
-                }
-            } else if line.trim() == "Comments:" {
-                let section_text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]).trim();
-                if section_text != EMPTY_COMMENTS_FIELD {
-                    set_if_none!("Comments", comments, section_text.to_owned());
-                }
-            } else if line.trim() == "Files:" {
-                let section_text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]);
-                let mut section_lines = section_text.lines();
-                while let Some(file) = SubmissionFile::new(section_lines.by_ref(), archive)? {
-                    files.push(file);
-                }
+            // Find the contents of the line up to the first colon, to read for section headers; if there isn't one,
+            // skip forwards.
+            let Some(c) = line.find(":") else { continue };
+            match &line[..c] {
+                "Name" => {
+                    let captures = STUDENT_NAME_REGEX
+                        .captures(line)
+                        .ok_or_else(|| /*TODO*/ "Malformed 'txt' datafile")?;
+
+                    // Can unwrap capture groups because the regex is strict enough that either the groups are there or
+                    // the entire thing would have failed:
+                    let fullname = captures.name("fullname").unwrap().as_str().to_owned().into_boxed_str();
+                    let username = captures.name("username").unwrap().as_str().to_owned().into_boxed_str();
+                    set_if_none!("Name", student_fullname, fullname);
+                    set_if_none!("Name", student_username, username);
+                },
+                "Date Submitted" => {
+                    let date_substr = line["Date Submitted:".len()..].trim();
+                    let date_parsed = NaiveDateTime::parse_from_str(date_substr, SUBMISSION_DATE_FORMAT)
+                        .map_err(|_| /*TODO*/ "Malformed date in 'txt' datafile")?;
+                    set_if_none!("Date Submitted", datetime, date_parsed);
+                },
+                "Submission Field" => {
+                    let text = read_section_until(lines.by_ref(), &["Comments:", "Files:"]).trim();
+                    let value = if text != EMPTY_SUBMISSION_FIELD { Some(text.to_owned()) } else { None };
+                    set_if_none!("Submission Field", text_sub, value);
+                },
+                "Comments" => {
+                    let text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]).trim();
+                    let value = if text != EMPTY_COMMENTS_FIELD { Some(text.to_owned()) } else { None };
+                    set_if_none!("Comments", comments, value);
+                },
+                "Files" => {
+                    let text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]);
+                    let mut lines = text.lines();
+
+                    let mut parsed_files = Vec::new();
+                    while let Some(file) = SubmissionFile::new(lines.by_ref(), archive)? {
+                        parsed_files.push(file);
+                    }
+
+                    set_if_none!("Files", files, parsed_files);
+                },
+                _ => {},
             }
         }
 
-        todo!();
+        if comments.is_none() {
+            /* TODO: warn that section was missing, but don't drop the whole submission because of it */
+        }
+
+        Ok(Self {
+            // TODO errors
+            student_fullname: student_fullname.ok_or("Missing 'Name:' in datafile")?,
+            student_username: student_username.ok_or("Missing 'Name:' in datafile")?,
+            datetime: datetime.ok_or("Missing 'Date Submitted' in datafile")?,
+            text_sub: text_sub.ok_or("Missing 'Submission Field' in datafile")?,
+            comments: comments.flatten(),
+            files: files.ok_or("Missing 'Files' section in datafile")?,
+        })
     }
 
     /// Returns the full name of the student who submitted this assignment.
