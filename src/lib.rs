@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt::Debug;
 use std::io::{Read, Seek};
 use std::iter::Peekable;
 use std::str::Lines;
@@ -41,7 +42,6 @@ const EMPTY_COMMENTS_FIELD: &str = "There are no student comments for this assig
 ///
 /// The date format at the end is `YYYY-MM-DD-hh-mm-ss`.
 static DATAFILE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    // NB: capture groups may be accessed both by name and by index; be careful moving them around.
     Regex::new(r"^(?<assn_name>.+?)_(?<username>[a-z0-9_]+)_attempt_(?<timestamp>\d{4}(?:-\d\d){5})\.txt$").unwrap()
 });
 
@@ -54,23 +54,23 @@ static STUDENT_NAME_REGEX: LazyLock<Regex> =
 ///
 /// A "gradebook" is not really a gradebook at all; rather, it is so named because of the names of the zip files given
 /// by Blackboard upon download.
-#[derive(Debug)]
+#[allow(unused)]
 pub struct Gradebook<R: Read + Seek> {
     /// The underlying [ZipArchive] that this gradebook comes from.
     archive: ZipArchive<R>,
     /// Metadata on all submissions found within the gradebook.
     submissions: Vec<Submission>,
     /// The name of the assignment, as parsed from Blackboard's datafiles.
-    assn_name: Box<str>,
+    assn_name: String,
 }
 
 /// Metadata for a single assignment submission.
 #[derive(Debug, Clone)]
 pub struct Submission {
     /// The full name of the student who submitted this assignment.
-    student_fullname: Box<str>,
+    student_fullname: String,
     /// The username of the student who submitted this assignment.
-    student_username: Box<str>,
+    student_username: String,
     /// When this assignment was submitted.
     datetime: NaiveDateTime,
     /// Any text that the student provided in the "Text Submission" field on Blackboard's interface.
@@ -87,9 +87,9 @@ pub struct SubmissionFile {
     /// The index within its original [ZipArchive] that this file lives at.
     zip_index: usize,
     /// The original name of the file, as uploaded by the student.
-    original_name: Box<str>,
+    original_name: String,
     /// The name of the file within Blackboard's gradebook file.
-    archive_name: Box<str>,
+    archive_name: String,
     /// The size of this file within the zip archive.
     size_zipped: u64,
     /// The approximate size of this file post-unzip.
@@ -97,30 +97,20 @@ pub struct SubmissionFile {
 }
 
 impl<R: Read + Seek> Gradebook<R> {
-    pub fn new(reader: R) -> Result<Self, /*TODO*/ Box<dyn Error>> {
+    /// Loads a Blackboard gradebook from a reader.
+    pub fn load(reader: R) -> Result<Self, /*TODO*/ Box<dyn Error>> {
+        println!("Loading gradebook...");
+
         let mut archive = ZipArchive::new(reader)?;
 
-        // Reading the datafiles' names and parsing them must be done in two steps, since the strings returned by
-        // `ZipArchive::file_names` are borrowed from the archive, but extracting contents requires a mutable reference.
+        // Start by collecting a list of all of the datafiles in the zip file. Doing this first lets us more efficiently
+        // allocate vectors for later.
+        println!("Finding datafiles...");
         let mut datafiles = Vec::new();
-        let mut assn_name = None;
-
-        let mut captures = DATAFILE_REGEX.capture_locations();
-        for filename in archive.file_names() {
-            // Read into `captures` object to parse assignment name; continue to next file if not a .txt datafile.
-            if DATAFILE_REGEX.captures_read(&mut captures, filename).is_some() {
-                // Unwrap is safe here because we know the match was successful:
-                let (name_s, name_e) = captures.get(0).unwrap();
-                let found_name = &filename[name_s..name_e];
-
-                // Verify that the name we found from this datafile matches the one we've found previously:
-                if assn_name.is_none() {
-                    assn_name = Some(found_name.to_owned().into_boxed_str());
-                } else if assn_name.as_deref().is_some_and(|curr| found_name != curr) {
-                    todo!("Handle what to do when two datafiles parse to provide different assignment names");
-                }
-
-                datafiles.push(filename.to_owned());
+        for i in 0..archive.len() {
+            let zipfile = archive.by_index(i)?; // TODO map err
+            if DATAFILE_REGEX.is_match(zipfile.name()) {
+                datafiles.push(i);
             }
         }
 
@@ -128,14 +118,30 @@ impl<R: Read + Seek> Gradebook<R> {
             return /*TODO*/ Err("Empty zip file".into());
         }
 
+        let mut assn_name = None;
+        let mut df_buffer = String::new();
+        let mut submissions = Vec::with_capacity(datafiles.len());
+
+        println!("Parsing datafiles...");
+        for i in datafiles {
+            df_buffer.clear();
+            archive.by_index(i)?.read_to_string(&mut df_buffer)?; // TODO map err
+
+            let (submission, parsed_assn_name) = parse_datafile(&df_buffer, &mut archive)?;
+
+            // Keep track of the assignment name we read: If this isn't the first one we've parsed, ensure that it's the
+            // same as previous ones.
+            if assn_name.is_none() {
+                assn_name = Some(parsed_assn_name);
+            } else if assn_name.as_deref().is_some_and(|curr| parsed_assn_name != curr) {
+                todo!("Handle what to do when two datafiles parse to provide different assignment names");
+            }
+
+            submissions.push(submission);
+        }
+
         let assn_name =
             assn_name.ok_or_else(|| /*TODO*/ "Failed to parse assignment name from Blackboard 'txt' files.")?;
-
-        let mut submissions = Vec::with_capacity(datafiles.len());
-        for datafile in datafiles {
-            let sub = Submission::new(&datafile, &mut archive)?;
-            submissions.push(sub);
-        }
 
         // Sort submissions by student username -> datetime:
         submissions.sort_by(|a, b| {
@@ -144,7 +150,7 @@ impl<R: Read + Seek> Gradebook<R> {
                 .then_with(|| a.datetime().cmp(&b.datetime()))
         });
 
-        Ok(Self { archive, assn_name, submissions })
+        Ok(Gradebook { archive, assn_name, submissions })
     }
 
     /// The name of the assignment, as parsed from Blackboard's datafiles.
@@ -158,102 +164,17 @@ impl<R: Read + Seek> Gradebook<R> {
     }
 }
 
-/// Macro that sets the given option to `Some(T)` if it is not already set, and returns an error otherwise.
-macro_rules! set_if_none {
-    ($txt:literal, $opt:ident, $val:expr) => {
-        if $opt.is_none() {
-            $opt = Some($val);
-        } else {
-            const MSG: &str = concat!("Duplicate field ", $txt, " in Blackboard 'txt' file!");
-            return /* TODO */ Err(MSG.into());
-        }
-    };
+impl<R: Read + Seek> Debug for Gradebook<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gradebook")
+            .field("archive", &"ZipArchive(...)") // exclude entire archive from debug output
+            .field("assn_name", &self.assn_name)
+            .field("submissions", &self.submissions)
+            .finish()
+    }
 }
 
 impl Submission {
-    pub(crate) fn new<R: Read + Seek>(
-        datafile: &str,
-        archive: &mut ZipArchive<R>,
-    ) -> Result<Submission, /*TODO*/ Box<dyn Error>> {
-        let datafile_contents = {
-            let mut datafile = archive.by_name(datafile)?;
-            let mut contents = Vec::new();
-            datafile.read_to_end(&mut contents)?;
-            String::from_utf8(contents).expect("Blackboard's '.txt' datafiles should be valid UTF-8")
-        };
-
-        // Parse the bits we need one-by-one:
-        let mut student_fullname = None;
-        let mut student_username = None;
-        let mut datetime = None;
-        let mut text_sub = None;
-        let mut comments = None;
-        let mut files = None;
-
-        let mut lines = datafile_contents.lines().peekable();
-        while let Some(line) = lines.next() {
-            // Find the contents of the line up to the first colon, to read for section headers; if there isn't one,
-            // skip forwards.
-            let Some(c) = line.find(":") else { continue };
-            match &line[..c] {
-                "Name" => {
-                    let captures = STUDENT_NAME_REGEX
-                        .captures(line)
-                        .ok_or_else(|| /*TODO*/ "Malformed 'txt' datafile")?;
-
-                    // Can unwrap capture groups because the regex is strict enough that either the groups are there or
-                    // the entire thing would have failed:
-                    let fullname = captures.name("fullname").unwrap().as_str().to_owned().into_boxed_str();
-                    let username = captures.name("username").unwrap().as_str().to_owned().into_boxed_str();
-                    set_if_none!("Name", student_fullname, fullname);
-                    set_if_none!("Name", student_username, username);
-                },
-                "Date Submitted" => {
-                    let date_substr = line["Date Submitted:".len()..].trim();
-                    let date_parsed = NaiveDateTime::parse_from_str(date_substr, SUBMISSION_DATE_FORMAT)
-                        .map_err(|_| /*TODO*/ "Malformed date in 'txt' datafile")?;
-                    set_if_none!("Date Submitted", datetime, date_parsed);
-                },
-                "Submission Field" => {
-                    let text = read_section_until(lines.by_ref(), &["Comments:", "Files:"]).trim();
-                    let value = if text != EMPTY_SUBMISSION_FIELD { Some(text.to_owned()) } else { None };
-                    set_if_none!("Submission Field", text_sub, value);
-                },
-                "Comments" => {
-                    let text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]).trim();
-                    let value = if text != EMPTY_COMMENTS_FIELD { Some(text.to_owned()) } else { None };
-                    set_if_none!("Comments", comments, value);
-                },
-                "Files" => {
-                    let text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]);
-                    let mut lines = text.lines();
-
-                    let mut parsed_files = Vec::new();
-                    while let Some(file) = SubmissionFile::new(lines.by_ref(), archive)? {
-                        parsed_files.push(file);
-                    }
-
-                    set_if_none!("Files", files, parsed_files);
-                },
-                _ => {},
-            }
-        }
-
-        if comments.is_none() {
-            /* TODO: warn that section was missing, but don't drop the whole submission because of it */
-        }
-
-        Ok(Self {
-            // TODO errors
-            student_fullname: student_fullname.ok_or("Missing 'Name:' in datafile")?,
-            student_username: student_username.ok_or("Missing 'Name:' in datafile")?,
-            datetime: datetime.ok_or("Missing 'Date Submitted' in datafile")?,
-            text_sub: text_sub.ok_or("Missing 'Submission Field' in datafile")?,
-            comments: comments.flatten(),
-            files: files.ok_or("Missing 'Files' section in datafile")?,
-        })
-    }
-
     /// Returns the full name of the student who submitted this assignment.
     pub fn student_fullname(&self) -> &str {
         &self.student_fullname
@@ -305,6 +226,184 @@ impl Submission {
     }
 }
 
+impl SubmissionFile {
+    /// Returns the index at which this file lives within its corresponding [ZipArchive].
+    pub fn zip_index(&self) -> usize {
+        self.zip_index
+    }
+
+    /// Returns the original name of the file, as uploaded by the student.
+    pub fn original_name(&self) -> &str {
+        &self.original_name
+    }
+
+    /// Returns the name of the file within Blackboard's gradebook file.
+    pub fn archive_name(&self) -> &str {
+        &self.archive_name
+    }
+
+    /// Returns the size of this file within the zip archive.
+    pub fn size_zipped(&self) -> u64 {
+        self.size_zipped
+    }
+
+    /// Returns the approximate size that this file will be after unzipping.
+    pub fn size_unzipped(&self) -> u64 {
+        self.size_unzipped
+    }
+}
+
+/// Macro that sets the given option to `Some(T)` if it is not already set, and returns an error otherwise.
+macro_rules! set_if_none {
+    ($txt:literal, $opt:ident, $val:expr) => {
+        if $opt.is_none() {
+            $opt = Some($val);
+        } else {
+            const MSG: &str = concat!("Duplicate field ", $txt, " in Blackboard 'txt' file!");
+            return /* TODO */ Err(MSG.into());
+        }
+    };
+}
+
+/// Parses a Blackboard `.txt` datafile, returning [submission-specific metadata][Submission] as well as the assignment
+/// name.
+fn parse_datafile<R: Read + Seek>(
+    df_contents: &str,
+    archive: &mut ZipArchive<R>,
+) -> Result<(Submission, String), /*TODO*/ Box<dyn Error>> {
+    // Parse the bits we need one-by-one:
+    let mut student_fullname = None;
+    let mut student_username = None;
+    let mut datetime = None;
+    let mut text_sub = None;
+    let mut comments = None;
+    let mut files = None;
+
+    // Even though we don't store the assignment name, we want to return it to the caller just in case.
+    let mut assn_name = None;
+
+    let mut lines = df_contents.lines().peekable();
+    while let Some(line) = lines.next() {
+        // Find the contents of the line up to the first colon, to read for section headers; if there isn't one, skip
+        // forwards.
+        let Some(c) = line.find(":") else { continue };
+        match &line[..c] {
+            "Name" => {
+                let captures = STUDENT_NAME_REGEX
+                    .captures(line)
+                    .ok_or_else(|| /*TODO*/ "Malformed 'txt' datafile")?;
+                // Can unwrap capture groups because the regex is strict enough that either the groups are there or the
+                // entire thing would have failed:
+                let fullname = captures.name("fullname").unwrap().as_str().to_owned();
+                let username = captures.name("username").unwrap().as_str().to_owned();
+                set_if_none!("Name", student_fullname, fullname);
+                set_if_none!("Name", student_username, username);
+            },
+            "Assignment" => {
+                let assn_substr = line["Assignment:".len()..].trim();
+                set_if_none!("Assignment", assn_name, assn_substr.to_owned());
+            },
+            "Date Submitted" => {
+                let date_substr = line["Date Submitted:".len()..].trim();
+                let date_parsed = NaiveDateTime::parse_from_str(date_substr, SUBMISSION_DATE_FORMAT)
+                    .map_err(|_| /*TODO*/ "Malformed date in 'txt' datafile")?;
+                set_if_none!("Date Submitted", datetime, date_parsed);
+            },
+            "Submission Field" => {
+                let text = read_section_until(lines.by_ref(), &["Comments:", "Files:"]).trim();
+                let value = (text != EMPTY_SUBMISSION_FIELD).then(|| text.to_owned());
+                set_if_none!("Submission Field", text_sub, value);
+            },
+            "Comments" => {
+                let text = read_section_until(lines.by_ref(), &["Submission Field:", "Files:"]).trim();
+                let value = (text != EMPTY_COMMENTS_FIELD).then(|| text.to_owned());
+                set_if_none!("Comments", comments, value);
+            },
+            "Files" => {
+                let text = read_section_until(lines.by_ref(), &["Submission Field:", "Comments:"]);
+                let mut section_lines = text.lines();
+
+                let mut parsed_files = Vec::new();
+                while let Some(file) = parse_files_section(section_lines.by_ref(), archive)? {
+                    parsed_files.push(file);
+                }
+
+                set_if_none!("Files", files, parsed_files);
+            },
+            _ => {},
+        }
+    }
+
+    if comments.is_none() {
+        /* TODO: warn that section was missing, but don't drop the whole submission because of it */
+    }
+
+    let assn_name = assn_name.ok_or("Missing 'Assignment:' in datafile")?;
+    let submission = Submission {
+        // TODO errors
+        student_fullname: student_fullname.ok_or("Missing 'Name:' in datafile")?,
+        student_username: student_username.ok_or("Missing 'Name:' in datafile")?,
+        datetime: datetime.ok_or("Missing 'Date Submitted' in datafile")?,
+        text_sub: text_sub.ok_or("Missing 'Submission Field' in datafile")?,
+        comments: comments.flatten(),
+        files: files.ok_or("Missing 'Files' section in datafile")?,
+    };
+
+    Ok((submission, assn_name))
+}
+
+/// Borrows the iterator created by [`parse_datafile`] to consume all lines related to files.
+///
+/// Returns `Ok(None)` when the lines iterator is exhausted.
+fn parse_files_section<'a, R: Read + Seek>(
+    lines: &mut Lines<'a>,
+    archive: &mut ZipArchive<R>,
+) -> Result<Option<SubmissionFile>, /*TODO*/ Box<dyn Error>> {
+    let mut original_name = None;
+    let mut archive_name = None;
+
+    for line in lines {
+        let line = line.trim_start();
+        if line.starts_with("Original filename:") {
+            let trimmed = line["Original filename:".len()..].trim().to_owned();
+            set_if_none!("Original filename:", original_name, trimmed);
+        } else if line.starts_with("Filename:") {
+            let trimmed = line["Filename:".len()..].trim().to_owned();
+            set_if_none!("Filename", archive_name, trimmed);
+        } else if line.len() == 0 {
+            break;
+        }
+    }
+
+    let original_name = match original_name {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+
+    let archive_name = match archive_name {
+        Some(name) => name,
+        None => return Err("'Files' section had 'Original filename', but no 'Filename'".into()),
+    };
+
+    let zip_index = archive
+        .index_for_name(&archive_name)
+        .ok_or_else(|| "Filename specified in Blackboard 'txt' not found within zipfile.")?;
+
+    let zipfile = archive
+        .by_name(&archive_name)
+        .expect("file referenced by datafile should be present in zip");
+    let size_zipped = zipfile.compressed_size();
+    let size_unzipped = zipfile.size();
+
+    Ok(Some(SubmissionFile {
+        archive_name,
+        original_name,
+        size_zipped,
+        size_unzipped,
+        zip_index,
+    }))
+}
+
 /// Reads a section of a Blackboard `.txt` datafile up until one of a specified set of lines is reached.
 fn read_section_until<'a>(lines: &mut Peekable<Lines<'a>>, stop_at: &[&str]) -> &'a str {
     let mut ptr_start = None;
@@ -338,83 +437,5 @@ fn read_section_until<'a>(lines: &mut Peekable<Lines<'a>>, stop_at: &[&str]) -> 
         },
         (None, None) => "",
         _ => unreachable!("either both pointers should be set or neither should be set"),
-    }
-}
-
-
-impl SubmissionFile {
-    /// Borrows the iterator created by [`Submission::new`] to consume all lines related to files.
-    pub(crate) fn new<'a, R: Read + Seek>(
-        lines: &mut Lines<'a>,
-        archive: &mut ZipArchive<R>,
-    ) -> Result<Option<Self>, /*TODO*/ Box<dyn Error>> {
-        let mut original_name = None;
-        let mut archive_name = None;
-
-        for line in lines {
-            let line = line.trim_start();
-            if line.starts_with("Original filename:") {
-                let trimmed = line["Original filename:".len()..].trim();
-                let trimmed = trimmed.to_owned().into_boxed_str();
-                set_if_none!("Original filename:", original_name, trimmed);
-            } else if line.starts_with("Filename:") {
-                let trimmed = line["Filename:".len()..].trim();
-                let trimmed = trimmed.to_owned().into_boxed_str();
-                set_if_none!("Filename", archive_name, trimmed);
-            } else if line.len() == 0 {
-                break;
-            }
-        }
-
-        let original_name = match original_name {
-            Some(name) => name,
-            None => return Ok(None),
-        };
-
-        let archive_name = match archive_name {
-            Some(name) => name,
-            None => return Err("'Files' section had 'Original filename', but no 'Filename'".into()),
-        };
-
-        let zip_index = archive
-            .index_for_name(&archive_name)
-            .ok_or_else(|| "Filename specified in Blackboard 'txt' not found within zipfile.")?;
-
-        let zipfile = archive.by_name(&archive_name).unwrap();
-        let size_zipped = zipfile.compressed_size();
-        let size_unzipped = zipfile.size();
-
-        Ok(Some(Self {
-            archive_name,
-            original_name,
-            size_zipped,
-            size_unzipped,
-            zip_index,
-        }))
-    }
-
-    /// Returns the index at which this file lives within its corresponding [ZipArchive].
-    pub fn zip_index(&self) -> usize {
-        self.zip_index
-    }
-
-    /// Returns the original name of the file, as uploaded by the student.
-    pub fn original_name(&self) -> &str {
-        &self.original_name
-    }
-
-    /// Returns the name of the file within Blackboard's gradebook file.
-    pub fn archive_name(&self) -> &str {
-        &self.archive_name
-    }
-
-    /// Returns the size of this file within the zip archive.
-    pub fn size_zipped(&self) -> u64 {
-        self.size_zipped
-    }
-
-    /// Returns the approximate size that this file will be after unzipping.
-    pub fn size_unzipped(&self) -> u64 {
-        self.size_unzipped
     }
 }
