@@ -33,27 +33,18 @@ const EMPTY_SUBMISSION_FIELD: &str = "There is no student submission text data f
 /// leave the field empty.
 const EMPTY_COMMENTS_FIELD: &str = "There are no student comments for this assignment.";
 
-/// Regex used to detect the `.txt` files used by Blackboard to document each student's submission inside of the
-/// gradebook.
-///
-/// This regex ensures that the '.txt' appears right after the `attempt_<TIMESTAMP>` portion of the filename, so
-/// it shouldn't ever catch any student-submitted '.txt' files (unless they submitted one that happened to have
-/// `_attempt_TIMESTAMP` right at the end, which is unlikely).
-///
-/// The date format at the end is `YYYY-MM-DD-hh-mm-ss`.
-static DATAFILE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?<assn_name>.+?)_(?<username>[a-z0-9_]+)_attempt_(?<timestamp>\d{4}(?:-\d\d){5})\.txt$").unwrap()
-});
-
 /// Regex used to extract a student's full name and username from Blackboard's '.txt' datafiles.
 static STUDENT_NAME_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+?)\s+\((?<username>[a-z0-9_]+)\)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^Name:\s+(?<fullname>.+)\s+\((?<username>.+)\)$").unwrap());
 
 
-/// A collection of submissions from a Blackboard assignment.
+/// A rich representation of a gradebook file downloaded from Blackboard.
 ///
-/// A "gradebook" is not really a gradebook at all; rather, it is so named because of the names of the zip files given
-/// by Blackboard upon download.
+/// This struct holds a [`ZipArchive`] of the underlying zip file and gives access to submission metadata so that it may
+/// be inspected and filtered before extracting.
+///
+/// A "gradebook" in this context is not really a gradebook. Rather, it is so named because of the names of the zip
+/// files given by Blackboard upon download: `gradebook_<course-code>_<assignment-name>_<date>.zip`.
 #[allow(unused)]
 pub struct Gradebook<R: Read + Seek> {
     /// The underlying [ZipArchive] that this gradebook comes from.
@@ -98,22 +89,11 @@ pub struct SubmissionFile {
 
 impl<R: Read + Seek> Gradebook<R> {
     /// Loads a Blackboard gradebook from a reader.
-    pub fn load(reader: R) -> Result<Self, /*TODO*/ Box<dyn Error>> {
-        println!("Loading gradebook...");
-
+    pub fn from_reader(reader: R) -> Result<Self, /*TODO*/ Box<dyn Error>> {
         let mut archive = ZipArchive::new(reader)?;
 
-        // Start by collecting a list of all of the datafiles in the zip file. Doing this first lets us more efficiently
-        // allocate vectors for later.
-        println!("Finding datafiles...");
-        let mut datafiles = Vec::new();
-        for i in 0..archive.len() {
-            let zipfile = archive.by_index(i)?; // TODO map err
-            if DATAFILE_REGEX.is_match(zipfile.name()) {
-                datafiles.push(i);
-            }
-        }
-
+        // Start by collecting a list of all of the datafiles in the zip file.
+        let datafiles = find_datafiles(&archive);
         if datafiles.len() == 0 {
             return /*TODO*/ Err("Empty zip file".into());
         }
@@ -122,7 +102,6 @@ impl<R: Read + Seek> Gradebook<R> {
         let mut df_buffer = String::new();
         let mut submissions = Vec::with_capacity(datafiles.len());
 
-        println!("Parsing datafiles...");
         for i in datafiles {
             df_buffer.clear();
             archive.by_index(i)?.read_to_string(&mut df_buffer)?; // TODO map err
@@ -171,6 +150,56 @@ impl<R: Read + Seek> Debug for Gradebook<R> {
             .field("assn_name", &self.assn_name)
             .field("submissions", &self.submissions)
             .finish()
+    }
+}
+
+/// Inspects the list of files in a gradebook and finds Blackboard's auto-generated info files.
+fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<usize> {
+    // Every gradebook file contains a series of auto-generated `.txt` files that give metadata on each assignment.
+    // These data files are our ticket to reliably determining information about the submissions without having to rely
+    // on trying to parse that information from filenames, which would be messy and fragile.
+    //
+    // Every filename in the gradebook looks like: `<dropbox>_<username>_attempt_<datetime>_<original-filename>`. The
+    // datafiles can be identified because they lack the `<original-filename>` section, and instead just end with a
+    // `.txt` extension. Attempting to find these files by regex-matching on `_attempt_<datetime>.txt$` is tempting, but
+    // error-prone.
+    if archive.len() == 0 {
+        Vec::new()
+    } else {
+        // - Recall: we want to find a way to differentiate between the following things:
+        //   - `<dropbox>_<username>_attempt_<timestamp>.txt`
+        //   - `<dropbox>_<username>_attempt_<timestamp>_<filename>.<ext>`
+        // - No matter what the student names their file, it will have an underscore where the Blackboard file has a
+        //   dot. Dots are is `U+002E`; underscores are `U+005F`. So, if we sort the list of filenames
+        //   lexicographically, the dot will always be first!
+        let mut files = archive.file_names().collect::<Vec<_>>();
+        files.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        let mut all_files = files.into_iter();
+        let mut datafiles = Vec::new();
+
+        // The first file is guaranteed to be a datafile, since (a) there is at least one 1 submission, (b) all
+        // submissions have a datafile, and (c) each submission's datafile will be lexicographically before its others.
+        let mut prev_df = all_files.next().unwrap();
+        datafiles.push(archive.index_for_name(prev_df).unwrap());
+
+        // To find where the next submission starts, we loop through the list of files, skipping them as long as they
+        // share a common prefix with the most recent datafile. Specifically, a common prefix with a length equal to
+        // `prev.len() - ".txt".len()`. This is the longest common prefix there could possibly be with a datafile. If
+        // the current file's prefix length is *shorter* than that, it means they differ somewhere before the end of the
+        // `<timestamp>` section, and therefore belong to different submissions; `curr` marks the start of the next
+        // submission, and is therefore a datafile.
+        while let Some(curr) = all_files.next() {
+            let s1 = prev_df.as_bytes().into_iter();
+            let s2 = curr.as_bytes().into_iter();
+            let prefix_len = s1.zip(s2).take_while(|(a, b)| a == b).count();
+            if prefix_len < prev_df.len() - ".txt".len() {
+                datafiles.push(archive.index_for_name(curr).unwrap());
+                prev_df = curr;
+            }
+        }
+
+        datafiles
     }
 }
 
