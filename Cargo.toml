@@ -3,13 +3,13 @@ name = "bb-gradebook"
 description = "Neatly extracts student submissions from zip files downloaded from Blackboard."
 authors = ["Matthew Brown <matthew.e.brown.17@gmail.com>"]
 version = "0.1.2"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-zip = "2.2.0"
-regex = "1.11.0"
-chrono = "0.4.38"
-thiserror = "1.0.64"
-clap = { version = "4.5.28", features = ["derive", "wrap_help"] }
+zip = "7.1.0"
+regex = "1.12.2"
+chrono = "0.4.43"
+thiserror = "2.0.17"
+clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
