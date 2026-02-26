@@ -46,7 +46,7 @@ static STUDENT_NAME_REGEX: LazyLock<Regex> =
 /// A "gradebook" in this context is not really a gradebook. Rather, it is so named because of the names of the zip
 /// files given by Blackboard upon download: `gradebook_<course-code>_<assignment-name>_<date>.zip`.
 #[allow(unused)]
-pub struct Gradebook<R: Read + Seek> {
+pub struct Gradebook<R> {
     /// The underlying [ZipArchive] that this gradebook comes from.
     archive: ZipArchive<R>,
     /// Metadata on all submissions found within the gradebook.
@@ -75,16 +75,116 @@ pub struct Submission {
 /// Metadata for a single file within a [Submission].
 #[derive(Debug, Clone)]
 pub struct SubmissionFile {
-    /// The index within its original [ZipArchive] that this file lives at.
+    /// The index within its original [`ZipArchive`] that this file lives at.
     zip_index: usize,
     /// The original name of the file, as uploaded by the student.
     original_name: String,
     /// The name of the file within Blackboard's gradebook file.
     archive_name: String,
-    /// The size of this file within the zip archive.
+    /// The compressed size of this file within the gradebook.
     size_zipped: u64,
-    /// The approximate size of this file post-unzip.
+    /// The approximate size of this file after unzipping the gradebook.
     size_unzipped: u64,
+}
+
+impl<R> Gradebook<R> {
+    /// The name of the assignment, as parsed from Blackboard's datafiles.
+    pub fn assn_name(&self) -> &str {
+        &self.assn_name
+    }
+
+    /// The number of submissions found in the zip file.
+    pub fn num_submissions(&self) -> usize {
+        self.submissions.len()
+    }
+
+    /// Returns an iterator over the submissions within this gradebook archive.
+    pub fn submissions(&self) -> impl Iterator<Item = &Submission> {
+        self.submissions.iter()
+    }
+}
+
+impl Submission {
+    /// Returns the full name of the student who submitted this assignment.
+    pub fn student_fullname(&self) -> &str {
+        &self.student_fullname
+    }
+
+    /// Returns the username of the student who submitted this assignment.
+    pub fn student_username(&self) -> &str {
+        &self.student_username
+    }
+
+    /// Returns any text provided by the student in the _Text Submission_ field on Blackboard, if any.
+    ///
+    /// This field usually contains HTML content, since it can contain formatting.
+    pub fn text_field(&self) -> Option<&str> {
+        self.text_sub.as_deref()
+    }
+
+    /// Returns any text provided by the student in the _Comments_ field on Blackboard, if any.
+    ///
+    /// This field usually contains plain-text, without any formatting.
+    pub fn comments_field(&self) -> Option<&str> {
+        self.comments.as_deref()
+    }
+
+    /// Returns the number of files in this submission.
+    pub fn num_files(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Returns an iterator of metadata for all of the files in this submission.
+    pub fn files(&self) -> impl Iterator<Item = &SubmissionFile> {
+        self.files.iter()
+    }
+
+    /// Returns the local time this assignment was submitted.
+    ///
+    /// Blackboard does not provide any timezone information in its zip files, so [NaiveDateTime] is as accurate as we
+    /// can get.
+    pub fn datetime(&self) -> NaiveDateTime {
+        self.datetime
+    }
+
+    /// Computes the total size of this submission's files within the zip archive.
+    pub fn size_zipped(&self) -> u64 {
+        self.files().fold(0, |acc, f| acc + f.size_zipped())
+    }
+
+    /// Computes the approximate total size of this submission's files after unzipping.
+    ///
+    /// FIXME: Does not account for nested archives at the moment.
+    pub fn size_unzipped(&self) -> u64 {
+        self.files().fold(0, |acc, f| acc + f.size_unzipped())
+    }
+}
+
+impl SubmissionFile {
+    /// Returns the index at which this file lives within its corresponding [ZipArchive].
+    pub fn zip_index(&self) -> usize {
+        self.zip_index
+    }
+
+    /// Returns the original name of the file, as uploaded by the student.
+    pub fn original_name(&self) -> &str {
+        &self.original_name
+    }
+
+    /// Returns the name of the file within Blackboard's gradebook file.
+    pub fn archive_name(&self) -> &str {
+        &self.archive_name
+    }
+
+    /// Returns the size of this file within the zip archive.
+    pub fn size_zipped(&self) -> u64 {
+        self.size_zipped
+    }
+
+    /// Returns the approximate size that this file will be after unzipping.
+    pub fn size_unzipped(&self) -> u64 {
+        self.size_unzipped
+    }
 }
 
 impl<R: Read + Seek> Gradebook<R> {
@@ -119,31 +219,12 @@ impl<R: Read + Seek> Gradebook<R> {
             submissions.push(submission);
         }
 
-        let assn_name =
-            assn_name.ok_or_else(|| /*TODO*/ "Failed to parse assignment name from Blackboard 'txt' files.")?;
-
-        // Sort submissions by student username -> datetime:
-        submissions.sort_by(|a, b| {
-            a.student_username()
-                .cmp(b.student_username())
-                .then_with(|| a.datetime().cmp(&b.datetime()))
-        });
-
+        let assn_name = assn_name.expect("should have parsed at least one datafile");
         Ok(Gradebook { archive, assn_name, submissions })
-    }
-
-    /// The name of the assignment, as parsed from Blackboard's datafiles.
-    pub fn assn_name(&self) -> &str {
-        &self.assn_name
-    }
-
-    /// The number of submissions found in the zip file.
-    pub fn num_submissions(&self) -> usize {
-        self.submissions.len()
     }
 }
 
-impl<R: Read + Seek> Debug for Gradebook<R> {
+impl<R> Debug for Gradebook<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gradebook")
             .field("archive", &"ZipArchive(...)") // exclude entire archive from debug output
@@ -200,85 +281,6 @@ fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<usize> {
         }
 
         datafiles
-    }
-}
-
-impl Submission {
-    /// Returns the full name of the student who submitted this assignment.
-    pub fn student_fullname(&self) -> &str {
-        &self.student_fullname
-    }
-
-    /// Returns the username of the student who submitted this assignment.
-    pub fn student_username(&self) -> &str {
-        &self.student_username
-    }
-
-    /// Returns any text provided by the student in the _Text Submission_ field on Blackboard, if any.
-    pub fn text_sub(&self) -> Option<&str> {
-        self.text_sub.as_deref()
-    }
-
-    /// Returns any text provided by the student in the _Comments_ field on Blackboard, if any.
-    pub fn comments(&self) -> Option<&str> {
-        self.comments.as_deref()
-    }
-
-    /// Returns the number of files in this submission.
-    pub fn num_files(&self) -> usize {
-        self.files.len()
-    }
-
-    /// Returns an iterator of metadata for all of the files in this submission.
-    pub fn files(&self) -> impl Iterator<Item = &SubmissionFile> {
-        (&self.files).into_iter()
-    }
-
-    /// Returns the local time this assignment was submitted.
-    ///
-    /// Blackboard does not provide any timezone information in its zip files, so [NaiveDateTime] is as accurate as we
-    /// can get.
-    pub fn datetime(&self) -> NaiveDateTime {
-        self.datetime
-    }
-
-    /// Computes the total size of this submission's files within the zip archive.
-    pub fn size_zipped(&self) -> u64 {
-        self.files().fold(0, |acc, f| acc + f.size_zipped())
-    }
-
-    /// Computes the approximate total size of this submission's files after unzipping.
-    ///
-    /// FIXME: Does not account for nested archives at the moment.
-    pub fn size_unzipped(&self) -> u64 {
-        self.files().fold(0, |acc, f| acc + f.size_unzipped())
-    }
-}
-
-impl SubmissionFile {
-    /// Returns the index at which this file lives within its corresponding [ZipArchive].
-    pub fn zip_index(&self) -> usize {
-        self.zip_index
-    }
-
-    /// Returns the original name of the file, as uploaded by the student.
-    pub fn original_name(&self) -> &str {
-        &self.original_name
-    }
-
-    /// Returns the name of the file within Blackboard's gradebook file.
-    pub fn archive_name(&self) -> &str {
-        &self.archive_name
-    }
-
-    /// Returns the size of this file within the zip archive.
-    pub fn size_zipped(&self) -> u64 {
-        self.size_zipped
-    }
-
-    /// Returns the approximate size that this file will be after unzipping.
-    pub fn size_unzipped(&self) -> u64 {
-        self.size_unzipped
     }
 }
 
@@ -419,7 +421,7 @@ fn parse_files_section<'a, R: Read + Seek>(
         .ok_or_else(|| "Filename specified in Blackboard 'txt' not found within zipfile.")?;
 
     let zipfile = archive
-        .by_name(&archive_name)
+        .by_index(zip_index)
         .expect("file referenced by datafile should be present in zip");
     let size_zipped = zipfile.compressed_size();
     let size_unzipped = zipfile.size();
