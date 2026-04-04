@@ -85,20 +85,6 @@ impl GradebookParser {
     }
 }
 
-/*
-/// Functions like [`Read::read_to_string`], except that it goes line-by-line and converts CRLF to LF if detected.
-fn read_lines_normalized<R: Read>(reader: R, buf: &mut String) -> io::Result<()> {
-    let mut buf_reader = BufReader::new(reader);
-    while buf_reader.read_line(buf)? > 0 {
-        // NB: buffer includes the newline, even if we don't splice it back in.
-        if buf.ends_with("\r\n") {
-            buf.replace_range(buf.len() - 2.., "\n");
-        }
-    }
-    Ok(())
-}
-*/
-
 /// Inspects the list of files in a gradebook archive and figures out which ones are Blackboard's auto-generated `txt`
 /// files (**datafiles**).
 ///
