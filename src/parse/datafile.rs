@@ -1,7 +1,7 @@
-use std::error::Error;
-
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
+
+use super::error::{DatafileError, DfErrorKind, FieldError, FilesSectionError, NameFieldError};
 
 /// The format specifier used to parse datetimes out of datafiles' `Date Submitted:` lines.
 ///
@@ -65,8 +65,8 @@ pub struct FileNames<'a> {
 /// Splits a line of text at the first colon `:` character it sees and tidies up either side with some trimming.
 ///
 /// Returns an error if no `:` character is present, or if there is no text before the colon.
-fn split_field_name(line: &str) -> Result<(&str, &str), Box<dyn Error>> {
-    let (name, body) = line.split_once(':').ok_or_else(|| format!("malformed field: expected ':'"))?;
+fn split_field_name(line: &str) -> Result<(&str, &str), FieldError> {
+    let (name, body) = line.split_once(':').ok_or(FieldError::NoColon)?;
 
     // Trim any spaces or tabs from the start of the field, but only remove at most a single space from the actual body
     // (so that a field that actually starts with whitespace will be correctly returned).
@@ -74,7 +74,7 @@ fn split_field_name(line: &str) -> Result<(&str, &str), Box<dyn Error>> {
     let body = body.strip_prefix(' ').unwrap_or(body);
 
     if name.is_empty() {
-        Err(format!("malformed field: empty name before ':'").into())
+        Err(FieldError::NoName)
     } else {
         Ok((name, body))
     }
@@ -83,7 +83,7 @@ fn split_field_name(line: &str) -> Result<(&str, &str), Box<dyn Error>> {
 /// Reads the body of a Blackboard `.txt` datafile and extracts the metadata within.
 ///
 /// Parsed values are returned as plain string slices into the original buffer to avoid an unnecessary allocations.
-pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Error>> {
+pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, DatafileError> {
     let mut lines = LineStream::new(body);
 
     // Citing the robustness principle, we allow the first four fields to appear in any order. Ideally, we would allow
@@ -94,14 +94,24 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
     let mut date_submitted_field = None;
     let mut current_grade_field = None;
 
-    // Instead of just looping 4x, count the number of fields we find; that way we can skip over blank lines (again,
-    // trying to be "robust"). This loop will also break if any of the next three fields (Submission Field, Comments,
-    // Files) are encountered.
-    let mut count = 0;
-    while count < 4 {
-        let line = lines
-            .peek_line()
-            .ok_or_else(|| format!("line {}: unexpected EOF: expected one of 'Name:', 'Assignment:', 'Current Grade:', or 'Date Submitted:'", lines.line_num()))?;
+    // Instead of looping exactly 4 times, we loop until we've found all four fields; that way we can skip over blank
+    // lines (again, trying to be "robust"). This loop will also break if any of the three larger sections (Submission
+    // Field, Comments, Files) are encountered.
+    while name_field.is_none()
+        || assignment_field.is_none()
+        || date_submitted_field.is_none()
+        || current_grade_field.is_none()
+    {
+        let line_num = lines.line_num();
+        let Some(line) = lines.peek_line() else {
+            // If we run out of lines before finding all four We want to return an error message that says which field
+            // we were currently looking for. We'll just report the first one in order that hasn't already been found.
+            let field = (name_field.is_none().then_some("'Name' field"))
+                .or_else(|| assignment_field.is_none().then_some("'Assignment' field"))
+                .or_else(|| date_submitted_field.is_none().then_some("'Date Submitted' field"))
+                .unwrap_or("'Current Grade' field");
+            return Err(DfErrorKind::EarlyEof(field).at_line(line_num));
+        };
 
         // Skip over any blank lines:
         if line.trim().is_empty() {
@@ -109,8 +119,7 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
             continue;
         }
 
-        let (field_name, contents) =
-            split_field_name(line).map_err(|err| format!("line {}: {err}", lines.line_num()))?;
+        let (field_name, contents) = split_field_name(line).map_err(|err| err.at_line(line_num))?;
 
         let field = match field_name {
             "Name" => &mut name_field,
@@ -122,29 +131,33 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
             // way, if they get lucky and one of the optional fields is missing, the line will remain in the buffer and
             // this function can proceed gracefully with trying to parse from there.
             "Submission Field" | "Comments" | "Files" => break,
-            _ => return Err(format!("line {}: unknown field {field_name}", lines.line_num()).into()),
+            _ => return Err(DfErrorKind::UnknownField(field_name.to_string()).at_line(lines.line_num())),
         };
 
         if field.is_some() {
-            return Err(format!("line {}: duplicate field {field_name}", lines.line_num()).into());
+            // [TODO] DuplicateField really could be holding a `&'static str`, since only the known valid field names
+            // could ever appear in here. But, that would mean re-organizing this loop to convert `field_name` into a
+            // static string upon matching, since it currently has lifetime 'a.
+            return Err(DfErrorKind::DuplicateField(field_name.to_string()).at_line(line_num));
         } else {
             *field = Some((contents, lines.line_num()));
-            count += 1;
             lines.move_next();
         }
     }
 
     let names = {
-        let (field, line_num) = name_field.ok_or_else(|| format!("missing 'Name' field"))?;
-        parse_names(field).map_err(|err| format!("line {line_num}: failed to parse 'Name' field: {err}"))?
+        let (field, line_num) = name_field.ok_or(DfErrorKind::MissingField("Name").at_line(lines.line_num()))?;
+        let names = parse_names(field).map_err(|err| DfErrorKind::from(err).at_line(line_num))?;
+        names
     };
 
-    let (assignment, _) = assignment_field.ok_or_else(|| format!("missing 'Assignment' field"))?;
+    let (assignment, _) = assignment_field.ok_or(DfErrorKind::MissingField("Assignment").at_line(lines.line_num()))?;
 
     let date_submitted = {
-        let (field, line_num) = date_submitted_field.ok_or_else(|| format!("missing 'Date Submitted' field"))?;
+        let (field, line_num) =
+            date_submitted_field.ok_or(DfErrorKind::MissingField("Date Submitted").at_line(lines.line_num()))?;
         NaiveDateTime::parse_from_str(field, SUBMISSION_DATE_FORMAT)
-            .map_err(|err| format!("line {line_num}: invalid datetime: {err}"))?
+            .map_err(|err| DfErrorKind::from(err).at_line(line_num))?
     };
 
     // We'll let 'Current Grade' be optional without throwing an error, again citing robustness principle.
@@ -162,10 +175,10 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
     // The next three depend on their ordering to parse properly. The first one should be the submission field.
     let line = lines
         .move_next()
-        .ok_or_else(|| format!("line {}: unexpected EOF before 'Submission Field' section", lines.line_num()))?;
+        .ok_or(DfErrorKind::EarlyEof("'Submission Field' section").at_line(lines.line_num()))?;
     if line.trim_end() != "Submission Field:" {
         let line_num = lines.line_num() - 1; // Since we just stepped forwards
-        return Err(format!("line {line_num}: expected 'Submission Field:', found '{line}'").into());
+        return Err(DfErrorKind::Unexpected("Submission Field", line.to_string()).at_line(line_num));
     }
 
     // The 'Submission Field:' field does not have free-form text: instead, it has WYSIWYG-formatted HTML content.
@@ -179,7 +192,7 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
     // no 'Comments' or 'Files' section.
     let sf_line1 = lines
         .move_next()
-        .ok_or_else(|| format!("line {}: unexpected EOF before 'Comments' section", lines.line_num()))?;
+        .ok_or(DfErrorKind::EarlyEof("'Comments' section").at_line(lines.line_num()))?;
 
     // To be more robust, what we actually want to search for is a blank line immediately followed by a "Comments:"
     // line. So, as we scan forwards, we need to look for a sequence of three lines that looks like:
@@ -193,7 +206,7 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
     let sf_last_line = loop {
         let next_line = lines
             .move_next()
-            .ok_or_else(|| format!("line {}: unexpected EOF before 'Comments' section", lines.line_num()))?;
+            .ok_or(DfErrorKind::EarlyEof("'Comments' section").at_line(lines.line_num()))?;
 
         last3[0] = last3[1];
         last3[1] = last3[2];
@@ -224,7 +237,7 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
 
     let comments_line1 = lines
         .move_next()
-        .ok_or_else(|| format!("line {}: unexpected EOF before 'Files' section", lines.line_num()))?;
+        .ok_or(DfErrorKind::EarlyEof("'Files' section").at_line(lines.line_num()))?;
 
     let mut comments_last_line = comments_line1;
     let mut files_line1 = None;
@@ -268,14 +281,13 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
             if let [_, _, Some(""), Some("Files:")] = last4 {
                 SmallVec::new()
             } else {
-                return Err(format!("line {}: unexpected EOF before 'Files' section", lines.line_num()).into());
+                return Err(DfErrorKind::EarlyEof("'Files' section").at_line(lines.line_num()));
             }
         },
         Some((files_line1, start_line)) => {
             // The body of the 'Files' section goes all the way to the end of the file.
             let fi = subslice_offset_start(body, files_line1).expect("files_line1 is a substring of body");
-            let files = parse_files(&body[fi..], start_line)
-                .map_err(|err| format!("failed to parse 'Files' section: {err}"))?;
+            let files = parse_files(&body[fi..], start_line)?;
             files
         },
     };
@@ -291,30 +303,28 @@ pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, Box<dyn Err
     })
 }
 
-fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, Box<dyn Error>> {
+fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, DfErrorKind> {
     // I'm *pretty sure* that student usernames can't have brackets in them, so finding a `(username)` at the end of the
     // line shouldn't require any counting of L/R parentheses. I have *no idea* if the students' actual names can have
     // brackets in them, though, so we'll sidestep that possibility by searching for the brackets from the end.
-    let i = field.rfind('(').ok_or_else(|| format!("expected '(' around username"))?;
+    let i = field.rfind('(').ok_or(NameFieldError::MissingL)?;
 
     // Search for closing bracket only after the opening bracket:
-    let j = field[i + 1..]
-        .rfind(')')
-        .ok_or_else(|| format!("expected ')' around username"))?;
+    let j = field[i + 1..].rfind(')').ok_or(NameFieldError::MissingR)?;
 
     let fullname = field[..i].trim();
     let username = field[i + 1..i + j].trim();
 
     if fullname.is_empty() {
-        return Err(format!("student's name is missing").into());
+        return Err(NameFieldError::EmptyFullname.into());
     } else if username.is_empty() {
-        return Err(format!("student's username is missing").into());
+        return Err(NameFieldError::EmptyUsername.into());
     }
 
     Ok(StudentNames { fullname, username })
 }
 
-fn parse_files<'a>(body: &'a str, start_line: usize) -> Result<SmallVec<[FileNames<'a>; 8]>, Box<dyn Error>> {
+fn parse_files<'a>(body: &'a str, start_line: usize) -> Result<SmallVec<[FileNames<'a>; 8]>, DatafileError> {
     if body == EMPTY_FILES_FIELD {
         return Ok(SmallVec::new());
     }
@@ -326,29 +336,21 @@ fn parse_files<'a>(body: &'a str, start_line: usize) -> Result<SmallVec<[FileNam
     let mut archive_name = None;
 
     while let Some(line) = lines.move_next() {
+        let line_num = lines.line_num() - 1; // Since we just stepped
         if line.trim().is_empty() {
             continue;
         }
 
         // NB: `split_field_name` will trim the name.
-        let (field_name, filename) = split_field_name(line)?;
+        let (field_name, filename) = split_field_name(line).map_err(|err| err.at_line(line_num))?;
         match (field_name, original_name, archive_name) {
             ("Original filename", None, _) => original_name = Some(filename),
             ("Filename", _, None) => archive_name = Some(filename),
             // If we encounter a second "Original filename" before first encountering a "Filename", or a second
             // "Filename" before first encountering an "Original filename", then we missed a field.
-            ("Original filename", Some(_), None) => {
-                let msg = format!("line {}: duplicate 'Original filename' before 'Filename'", lines.line_num());
-                return Err(msg.into());
-            },
-            ("Filename", None, Some(_)) => {
-                let msg = format!("line {}: duplicate 'Filename' before 'Original filename'", lines.line_num());
-                return Err(msg.into());
-            },
-            (_other, _, _) => {
-                let msg = format!("line {}: unknown field '{field_name}'", lines.line_num());
-                return Err(msg.into());
-            },
+            ("Original filename", Some(_), None) => return Err(FilesSectionError::DuplicateOriginal.at_line(line_num)),
+            ("Filename", None, Some(_)) => return Err(FilesSectionError::DuplicateZipped.at_line(line_num)),
+            (_other, _, _) => return Err(FilesSectionError::UnknownField(field_name.to_string()).at_line(line_num)),
         }
 
         if let (Some(original), Some(zipped)) = (original_name, archive_name) {
@@ -378,7 +380,7 @@ struct LineStream<'a> {
 }
 
 impl<'a> LineStream<'a> {
-    /// Creates a new [`LineStream`].
+    /// Creates a new [`LineStream`] with a line number starting at 1.
     pub fn new(buf: &'a str) -> Self {
         LineStream {
             buf,

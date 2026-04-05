@@ -12,7 +12,7 @@ pub enum GradebookLoadError {
     ZipOpen(ZipError),
 
     #[error("failed to parse {filename}: {inner}")]
-    Datafile { filename: String, inner: Box<dyn std::error::Error> },
+    Datafile { filename: String, inner: DatafileError },
 
     #[error("gradebook contains no submissions")]
     Empty,
@@ -65,8 +65,8 @@ pub struct DatafileError {
 // string might be better... this struct is 40 bytes vs. a `String`'s 24 or `Box<str>`'s 16.
 
 #[derive(Debug, Clone, thiserror::Error)]
-enum DfErrorKind {
-    #[error("reached EOF before finding '{0}' field")]
+pub(super) enum DfErrorKind {
+    #[error("unexpected early EOF: expected {0} before end of file")]
     EarlyEof(&'static str),
 
     #[error("missing '{0}' field")]
@@ -79,7 +79,7 @@ enum DfErrorKind {
     UnknownField(String),
 
     #[error("duplicate field '{0}'")]
-    DuplicateField(&'static str),
+    DuplicateField(String),
 
     #[error("expected '{0}', found '{1}'")]
     Unexpected(&'static str, String),
@@ -95,7 +95,7 @@ enum DfErrorKind {
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-enum FieldError {
+pub(super) enum FieldError {
     #[error("expected ':' before EOL")]
     NoColon,
     #[error("expected name before ':'")]
@@ -103,7 +103,7 @@ enum FieldError {
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-enum NameFieldError {
+pub(super) enum NameFieldError {
     #[error("expected '(' around username")]
     MissingL,
     #[error("expected ')' around username")]
@@ -115,11 +115,35 @@ enum NameFieldError {
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-enum FilesSectionError {
+pub(super) enum FilesSectionError {
     #[error("encountered two 'Original filename' fields in a row without a 'Filename' in between")]
     DuplicateOriginal,
     #[error("encountered two 'Filename' fields in a row without an 'Original filename' in between")]
     DuplicateZipped,
     #[error("unknown field '{0}'")]
     UnknownField(String),
+}
+
+impl DfErrorKind {
+    pub fn at_line(self, line: usize) -> DatafileError {
+        DatafileError { line, kind: self }
+    }
+}
+
+impl FieldError {
+    pub fn at_line(self, line: usize) -> DatafileError {
+        DatafileError {
+            line,
+            kind: DfErrorKind::MalformedField(self),
+        }
+    }
+}
+
+impl FilesSectionError {
+    pub fn at_line(self, line: usize) -> DatafileError {
+        DatafileError {
+            line,
+            kind: DfErrorKind::BadFilesSection(self),
+        }
+    }
 }
