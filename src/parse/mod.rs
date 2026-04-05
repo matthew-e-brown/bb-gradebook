@@ -3,6 +3,7 @@
 //! The main entrypoint of this module is the [`parse_gradebook`] function.
 
 mod datafile;
+pub mod error;
 mod gradebook;
 
 use std::io::{Read, Seek};

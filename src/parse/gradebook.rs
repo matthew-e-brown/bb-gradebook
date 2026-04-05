@@ -6,7 +6,7 @@ use hashbrown::HashTable;
 use smallvec::SmallVec;
 
 use super::datafile::parse_datafile;
-use crate::error::GradebookLoadError;
+use super::error::GradebookLoadError;
 use crate::{AttemptInfo, FileInfo, GradebookInfo, StudentInfo, ZipArchive};
 
 /// Parser state for parsing a [`GradebookInfo`] from a Blackboard gradebook file.
