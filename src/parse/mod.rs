@@ -93,7 +93,7 @@ impl GradebookParser {
 
             self.attempts.push(AttemptInfo {
                 student: student_index,
-                datetime: date_submitted,
+                date_submitted,
                 text_submission: submission_field.map(str::to_owned),
                 comments: comments.map(str::to_owned),
                 current_grade: current_grade.map(str::to_owned),
@@ -116,8 +116,8 @@ impl GradebookParser {
                     zip_index,
                     original_name: filenames.original.to_owned(),
                     archive_name: filenames.archive.to_owned(),
-                    size_zipped: zipfile.compressed_size(),
                     size_unzipped: zipfile.size(),
+                    size_zipped: zipfile.compressed_size(),
                 });
             }
 

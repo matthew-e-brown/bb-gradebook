@@ -1,14 +1,15 @@
 use std::io::{Read, Seek};
 use std::ops::Range;
 
-use chrono::NaiveDateTime;
 use smallvec::SmallVec;
-pub use zip::read::ZipArchive;
 
 pub use crate::error::GradebookLoadError;
 
 pub mod error;
 mod parse;
+
+/// Re-export of [`zip::ZipArchive`], used as the source for a [`GradebookArchive`].
+pub use zip::ZipArchive;
 
 /// A rich representation of a gradebook file downloaded from Blackboard.
 ///
@@ -53,7 +54,7 @@ pub struct AttemptInfo {
     /// The index of the [StudentInfo] (within [`GradebookInfo::students`]) who submitted this attempt.
     student: usize,
     /// When this attempt was submitted.
-    datetime: NaiveDateTime,
+    date_submitted: chrono::NaiveDateTime,
     /// Any text that the student provided in the "Text Submission" field on Blackboard's interface.
     text_submission: Option<String>,
     /// Any comments provided by the student when submitting.
@@ -74,31 +75,204 @@ pub struct FileInfo {
     original_name: String,
     /// The name of the file within Blackboard's gradebook file.
     archive_name: String,
-    /// The compressed size of this file within the gradebook.
-    size_zipped: u64,
     /// The approximate size of this file after unzipping the gradebook.
     size_unzipped: u64,
+    /// The compressed size of this file within the gradebook.
+    size_zipped: u64,
 }
 
 impl<R: Read + Seek> GradebookArchive<R> {
+    /// Creates a new [`ZipArchive`] over the given reader and parses its contents as a Blackboard gradebook.
     pub fn from_reader(reader: R) -> Result<Self, GradebookLoadError> {
-        let mut archive = ZipArchive::new(reader)?;
+        let archive = ZipArchive::new(reader)?;
+        Self::from_archive(archive)
+    }
+
+    /// Parses a [`ZipArchive`]'s contents as a Blackboard gradebook.
+    pub fn from_archive(mut archive: ZipArchive<R>) -> Result<Self, GradebookLoadError> {
         let info = GradebookInfo::from_archive(&mut archive)?;
         Ok(Self { archive, info })
     }
 
+    /// Returns a reference to this gradebook's [`GradebookInfo`].
     pub fn info(&self) -> &GradebookInfo {
         &self.info
+    }
+
+    /// Discard this gradebook archive's underlying reader and return just the underlying [`GradebookInfo`].
+    pub fn into_info(self) -> GradebookInfo {
+        self.info
+    }
+}
+
+impl<R: Read + Seek> AsRef<GradebookInfo> for GradebookArchive<R> {
+    /// Returns a reference to this gradebook's [`GradebookInfo`].
+    fn as_ref(&self) -> &GradebookInfo {
+        self.info()
+    }
+}
+
+// Not sure if I'm a huge fan of repeating all the getters from GradebookInfo... but it'll make the two more
+// interchangeable.
+impl<R: Read + Seek> GradebookArchive<R> {
+    /// Returns the name of this gradebook's associated assignment.
+    pub fn assignment_name(&self) -> &str {
+        self.info.assignment_name()
+    }
+
+    /// Returns a list of information about the students in this gradebook.
+    pub fn students(&self) -> &[StudentInfo] {
+        self.info.students()
+    }
+
+    /// Returns a list of information about the individual attempts in this gradebook.
+    pub fn attempts(&self) -> &[AttemptInfo] {
+        self.info.attempts()
+    }
+
+    /// Returns a list of information about all the submitted files in this gradebook.
+    pub fn files(&self) -> &[FileInfo] {
+        self.info.files()
     }
 }
 
 impl GradebookInfo {
+    /// Creates a new [`ZipArchive`] over the given reader and parses its contents as a Blackboard gradebook.
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<GradebookInfo, GradebookLoadError> {
         let mut archive = ZipArchive::new(reader)?;
         Self::from_archive(&mut archive)
     }
 
+    /// Parses a [`ZipArchive`]'s contents as a Blackboard gradebook.
     pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<GradebookInfo, GradebookLoadError> {
         parse::parse_gradebook(archive)
+    }
+
+    /// Returns the name of this gradebook's associated assignment.
+    pub fn assignment_name(&self) -> &str {
+        &self.assignment_name
+    }
+
+    /// Returns a list of information about the students in this gradebook.
+    pub fn students(&self) -> &[StudentInfo] {
+        &self.students
+    }
+
+    /// Returns a list of information about the individual attempts in this gradebook.
+    pub fn attempts(&self) -> &[AttemptInfo] {
+        &self.attempts
+    }
+
+    /// Returns a list of information about all the submitted files in this gradebook.
+    pub fn files(&self) -> &[FileInfo] {
+        &self.files
+    }
+}
+
+impl StudentInfo {
+    /// Returns the student's username.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Returns the student's full name.
+    pub fn fullname(&self) -> &str {
+        &self.fullname
+    }
+
+    /// Returns the indices of the attempts that belong to this student.
+    ///
+    /// See [`GradebookInfo::attempts()`].
+    pub fn attempt_indices(&self) -> &[usize] {
+        // [NOTE] [TODO] Something to think about.
+        //
+        // Instead of returning a `usize` slice directly, it may be preferable to return a custom `Attempts` iterator.
+        // That way, if we ever decide to update the internals to use a different data structure (i.e. a BTree or
+        // something), it won't be a breaking change when we no longer have access to a contiguous slice.
+        &self.attempts
+    }
+}
+
+impl AttemptInfo {
+    /// Returns the index of the student that made this attempt.
+    ///
+    /// See [`GradebookInfo::students()`].
+    pub fn student_index(&self) -> usize {
+        self.student
+    }
+
+    /// Returns the date and time at which this attempt was submitted to Blackboard.
+    ///
+    /// Blackboard's datafiles do not include any timezone information, so a [`NaiveDateTime`][chrono::NaiveDateTime] is
+    /// the best we can do.
+    pub fn date_submitted(&self) -> chrono::NaiveDateTime {
+        self.date_submitted
+    }
+
+    /// Returns the "Text Submission" for this attempt, if one was provided.
+    pub fn text_submission(&self) -> Option<&str> {
+        self.text_submission.as_deref()
+    }
+
+    /// Returns any student comments for this attempt, if they were provided.
+    pub fn comments(&self) -> Option<&str> {
+        self.comments.as_deref()
+    }
+
+    /// Returns the current grade of this attempt, if it has one.
+    ///
+    /// Attempts that were marked as "Needs Grading" will return `None`.
+    ///
+    /// The current grade is returned as a string because Blackboard allows the primary grade display to be configured
+    /// as anything from a percentage score, to an A–F letter grade, to institution-specific formats.
+    pub fn current_grade(&self) -> Option<&str> {
+        self.current_grade.as_deref()
+    }
+
+    /// Returns the range of indices of all the files associated with this attempt.
+    ///
+    /// See [`GradebookInfo::files()`].
+    pub fn file_indices(&self) -> Option<Range<usize>> {
+        self.files.clone() // std::ops::Range<usize> still isn't Copy for some reason
+    }
+}
+
+impl FileInfo {
+    /// Returns the index of the attempt this file belongs to.
+    ///
+    /// See [`GradebookInfo::attempts()`].
+    pub fn attempt_index(&self) -> usize {
+        self.attempt
+    }
+
+    /// Returns this file's index in the original [`ZipArchive`] that the gradebook was parsed from.
+    ///
+    /// This index can be used directly with [`ZipArchive::by_index`] to retrieve a [`ZipFile`] from the `zip` crate to
+    /// allow for extracting the file.
+    ///
+    /// [`ZipFile`]: zip::read::ZipFile
+    pub fn zip_index(&self) -> usize {
+        self.zip_index
+    }
+
+    /// Returns the name of this file, as submitted by the student.
+    pub fn original_name(&self) -> &str {
+        &self.original_name
+    }
+
+    /// Returns the name of this file as it appears inside the [`ZipArchive`] (after being renamed by Blackboard for
+    /// packaging in the gradebook zip).
+    pub fn archive_name(&self) -> &str {
+        &self.archive_name
+    }
+
+    /// Returns the approximate size of this file post-extraction from the [`ZipArchive`], in bytes.
+    pub fn size(&self) -> u64 {
+        self.size_unzipped
+    }
+
+    /// Returns the compressed size of this file within the [`ZipArchive`], in bytes.
+    pub fn size_zipped(&self) -> u64 {
+        self.size_zipped
     }
 }
