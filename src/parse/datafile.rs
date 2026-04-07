@@ -439,6 +439,13 @@ fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, NameError> {
 }
 
 fn parse_files<'a>(stream: &mut LineStream<'a>) -> Result<SmallVec<[FileNames<'a>; 8]>, FilesError> {
+    // Since the 'Files' section has further parsing to do, we need to check for the special "No files" text here
+    // instead of at the end.
+    if stream.current() == EMPTY_FILES_FIELD {
+        stream.next();
+        return Ok(SmallVec::new());
+    }
+
     // Once again, it's convenient to have access to the data we're building up through the `self`.
     struct FilesParser<'a> {
         files: SmallVec<[FileNames<'a>; 8]>,
@@ -456,11 +463,7 @@ fn parse_files<'a>(stream: &mut LineStream<'a>) -> Result<SmallVec<[FileNames<'a
         }
 
         fn handle_line(&mut self, line: &'a str) -> Result<ControlFlow<()>, FilesError> {
-            // Since the 'Files' section has further parsing to do, we need to check for the special "No files" text
-            // here instead of at the end.
-            if line == EMPTY_FILES_FIELD {
-                return Ok(ControlFlow::Break(()));
-            } else if line.trim().is_empty() {
+            if line.trim().is_empty() {
                 return Ok(ControlFlow::Continue(()));
             }
 
