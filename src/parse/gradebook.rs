@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use hashbrown::HashTable;
 use smallvec::SmallVec;
 
-use super::datafile::parse_datafile;
+use super::datafile::DatafileParser;
 use super::error::GradebookLoadError;
 use crate::{AttemptInfo, FileInfo, GradebookInfo, StudentInfo, ZipArchive};
 
@@ -53,13 +53,18 @@ impl GradebookParser {
 
             // [TODO] Don't cancel the entire thing over one bad datafile; find some way to gracefully collect failed
             // datafile parses elsewhere and report them separately.
-            let datafile = parse_datafile(&df_buffer).map_err(|err| GradebookLoadError::Datafile {
-                filename: archive
-                    .name_for_index(df_index)
-                    .expect("df_index is already known to be valid")
-                    .to_owned(),
-                inner: err,
-            })?;
+            let datafile = match DatafileParser::new(&df_buffer).parse() {
+                Ok(info) => info,
+                Err(inner) => {
+                    let filename = archive
+                        .name_for_index(df_index)
+                        .expect("df_index is already known to be valid")
+                        .to_owned();
+                    return Err(GradebookLoadError::Datafile { filename, inner });
+                },
+            };
+
+            println!("Parsed datafile:\n{:#?}\n", datafile);
         }
 
         todo!();

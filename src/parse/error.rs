@@ -1,149 +1,119 @@
-use std::io;
+pub use datafile::DatafileError;
+pub use gradebook::GradebookLoadError;
 
-use zip::result::ZipError;
+pub mod gradebook {
+    use std::io;
 
-/// An error that occurs when attempting to load Gradebook information from a zip file.
-#[derive(Debug, thiserror::Error)]
-pub enum GradebookLoadError {
-    #[error("IO error occurred reading from zip file: {0}")]
-    IO(#[from] io::Error),
+    use zip::result::ZipError;
 
-    #[error("failed to open zip file: {0}")]
-    ZipOpen(ZipError),
+    use super::datafile::DatafileError;
 
-    #[error("failed to parse {filename}: {inner}")]
-    Datafile { filename: String, inner: DatafileError },
+    /// An error that occurs when attempting to load Gradebook information from a zip file.
+    #[derive(Debug, thiserror::Error)]
+    pub enum GradebookLoadError {
+        #[error("IO error occurred reading from zip file: {0}")]
+        IO(#[from] io::Error),
 
-    #[error("gradebook contains no submissions")]
-    Empty,
-}
+        #[error("failed to open zip file: {0}")]
+        ZipOpen(ZipError),
 
-impl From<ZipError> for GradebookLoadError {
-    fn from(value: ZipError) -> Self {
-        match value {
-            ZipError::Io(err) => Self::IO(err),
-            err => Self::ZipOpen(err),
+        #[error("failed to parse {filename}: {inner}")]
+        Datafile { filename: String, inner: DatafileError },
+
+        #[error("gradebook contains no submissions")]
+        Empty,
+    }
+
+    impl From<ZipError> for GradebookLoadError {
+        fn from(value: ZipError) -> Self {
+            match value {
+                ZipError::Io(err) => Self::IO(err),
+                err => Self::ZipOpen(err),
+            }
         }
     }
 }
 
-// Additional Gradebook error cases:
-//
-// - A datafile referencing a file which does not appear in the archive
+pub mod datafile {
+    use std::fmt::Display;
 
-// Datafile errors:
-//
-// - ✔️ Unexpected EOF before all four of the initial fields are encountered
-// - ✔️ Malformed field:
-//   - Missing colon in first four fields' lines
-//   - Empty text before colon in first four fields' lines
-// - ✔️ Unknown field name in first four fields
-// - ✔️ Duplicate field name in four four fields
-// - ✔️ Missing 'Name', 'Assignment', or 'Date Submitted' fields
-// - ✔️ Malformed 'Name' field:
-//   - Missing '(' or ')'
-//   - Fullname or username is empty
-// - ✔️ Malformed datetime for 'Date Submitted' (wraps chrono)
-// - ✔️ Unexpected EOF before hitting 'Submission Field'
-// - ✔️ Hitting a different line instead of 'Submission Field' after the first four fields
-// - ✔️ Unexpected EOF before hitting 'Comments' section
-// - ✔️ Unexpected EOF before hitting 'Files' section
-// - ✔️ Malformed 'Files' section:
-//   - Duplicate field before seeing both fields
-//   - Unknown field
-//
-// All of these carry a line number with them.
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum DatafileError {
+        #[error("duplicate field '{field}' on line {line_num}")]
+        DuplicateField { field: Field, line_num: usize },
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("line {line}: {kind}")]
-pub struct DatafileError {
-    line: usize,
-    kind: DfErrorKind,
-}
+        #[error("failed to parse field '{field}' on line {line_num}: {inner}")]
+        FieldParse {
+            field: Field,
+            inner: FieldParseError,
+            line_num: usize,
+        },
 
-// Hmm... at this rate, with so many variants (some of which literally represent one path), I think just wrapping a
-// string might be better... this struct is 40 bytes vs. a `String`'s 24 or `Box<str>`'s 16.
+        #[error("unexpected text at line {line_num}: `{text}`")]
+        Unexpected { text: Box<str>, line_num: usize },
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum DfErrorKind {
-    #[error("unexpected early EOF: expected {0} before end of file")]
-    EarlyEof(&'static str),
+        #[error("unknown field '{field}'")]
+        UnknownField { field: Box<str>, line_num: usize },
 
-    #[error("missing '{0}' field")]
-    MissingField(&'static str),
-
-    #[error("malformed field: {0}")]
-    MalformedField(#[from] FieldError),
-
-    #[error("unknown field '{0}'")]
-    UnknownField(String),
-
-    #[error("duplicate field '{0}'")]
-    DuplicateField(String),
-
-    #[error("expected '{0}', found '{1}'")]
-    Unexpected(&'static str, String),
-
-    #[error("invalid datetime: {0}")]
-    BadDatetime(#[from] chrono::ParseError),
-
-    #[error("failed to parse 'Names' field: {0}")]
-    BadNameField(#[from] NameFieldError),
-
-    #[error("failed to parse 'Files' section: {0}")]
-    BadFilesSection(#[from] FilesSectionError),
-}
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-pub(super) enum FieldError {
-    #[error("expected ':' before EOL")]
-    NoColon,
-    #[error("expected name before ':'")]
-    NoName,
-}
-
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-pub(super) enum NameFieldError {
-    #[error("expected '(' around username")]
-    MissingL,
-    #[error("expected ')' around username")]
-    MissingR,
-    #[error("student's name is missing")]
-    EmptyFullname,
-    #[error("student's username is missing")]
-    EmptyUsername,
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum FilesSectionError {
-    #[error("encountered two 'Original filename' fields in a row without a 'Filename' in between")]
-    DuplicateOriginal,
-    #[error("encountered two 'Filename' fields in a row without an 'Original filename' in between")]
-    DuplicateZipped,
-    #[error("unknown field '{0}'")]
-    UnknownField(String),
-}
-
-impl DfErrorKind {
-    pub fn at_line(self, line: usize) -> DatafileError {
-        DatafileError { line, kind: self }
+        #[error("field '{field}' not found")]
+        MissingField { field: Field },
     }
-}
 
-impl FieldError {
-    pub fn at_line(self, line: usize) -> DatafileError {
-        DatafileError {
-            line,
-            kind: DfErrorKind::MalformedField(self),
+    /// The field at which an error occurred.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Field {
+        Name,
+        Assignment,
+        DateSubmitted,
+        CurrentGrade,
+        SubmissionField,
+        Comments,
+        Files,
+    }
+
+    impl Display for Field {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Field::Name => "Name",
+                Field::Assignment => "Assignment",
+                Field::DateSubmitted => "Date Submitted",
+                Field::CurrentGrade => "Current Grade",
+                Field::SubmissionField => "Submission Field",
+                Field::Comments => "Comments",
+                Field::Files => "Files",
+            })
         }
     }
-}
 
-impl FilesSectionError {
-    pub fn at_line(self, line: usize) -> DatafileError {
-        DatafileError {
-            line,
-            kind: DfErrorKind::BadFilesSection(self),
-        }
+    #[derive(Debug, Clone, thiserror::Error)]
+    #[error(transparent)]
+    pub enum FieldParseError {
+        Name(#[from] NameError),
+        DateSubmitted(#[from] chrono::ParseError),
+        Files(#[from] FilesError),
+    }
+
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum NameError {
+        #[error("expected '(' around username")]
+        MissingL,
+
+        #[error("expected ')' around username")]
+        MissingR,
+
+        #[error("student's name is missing")]
+        EmptyFullname,
+
+        #[error("student's username is missing")]
+        EmptyUsername,
+    }
+
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum FilesError {
+        #[error("file is missing an 'Original filename' field")]
+        MissingOriginal,
+
+        #[error("file is missing a 'Filename' field")]
+        MissingArchive,
     }
 }

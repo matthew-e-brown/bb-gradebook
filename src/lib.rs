@@ -1,4 +1,3 @@
-mod error;
 mod parse;
 
 use std::io::{Read, Seek};
@@ -7,7 +6,7 @@ use chrono::NaiveDateTime;
 use smallvec::SmallVec;
 pub use zip::read::ZipArchive;
 
-pub use crate::error::GradebookLoadError;
+pub use crate::parse::error::GradebookLoadError;
 
 /// A rich representation of a gradebook file downloaded from Blackboard.
 ///

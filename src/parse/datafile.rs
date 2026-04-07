@@ -1,7 +1,10 @@
+use std::ops::ControlFlow;
+
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
 
-use super::error::{DatafileError, DfErrorKind, FieldError, FilesSectionError, NameFieldError};
+use super::error::DatafileError;
+use super::error::datafile::{self as error, FieldParseError, FilesError, NameError};
 
 /// The format specifier used to parse datetimes out of datafiles' `Date Submitted:` lines.
 ///
@@ -48,7 +51,7 @@ pub struct DatafileInfo<'a> {
 }
 
 /// Struct for the captured text in the `Name: Fullname (username)` line in a datafile.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct StudentNames<'a> {
     fullname: &'a str,
     username: &'a str,
@@ -56,320 +59,481 @@ pub struct StudentNames<'a> {
 
 /// Struct for the captured text in the `Original Filename: ...` and `Filename: ...` lines of the `Files:` section in a
 /// datafile.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileNames<'a> {
     original: &'a str,
-    zipped: &'a str,
+    archive: &'a str,
+}
+
+/// The name of a field parsed out of a datafile.
+///
+/// Since short (single-line) and long (multi-line) fields are parsed differently, it's convenient to be able to
+/// distinguish between the two. Having distinct enums makes it easier to work with match statements. For
+/// error-reporting purposes, though, we don't need that much granularity; hence the existence of the separate (and
+/// public) [`error::Field`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Short(ShortField),
+    Long(LongField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortField {
+    Name,
+    Assignment,
+    DateSubmitted,
+    CurrentGrade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongField {
+    SubmissionField,
+    Comments,
+    Files,
+}
+
+impl From<ShortField> for Field {
+    fn from(value: ShortField) -> Self {
+        Field::Short(value)
+    }
+}
+
+impl From<LongField> for Field {
+    fn from(value: LongField) -> Self {
+        Field::Long(value)
+    }
+}
+
+impl Field {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Name" => Some(Field::Short(ShortField::Name)),
+            "Assignment" => Some(Field::Short(ShortField::Assignment)),
+            "Date Submitted" => Some(Field::Short(ShortField::DateSubmitted)),
+            "Current Grade" => Some(Field::Short(ShortField::CurrentGrade)),
+            "Submission Field" => Some(Field::Long(LongField::SubmissionField)),
+            "Comments" => Some(Field::Long(LongField::Comments)),
+            "Files" => Some(Field::Long(LongField::Files)),
+            _ => None,
+        }
+    }
+}
+
+impl From<Field> for error::Field {
+    fn from(value: Field) -> Self {
+        match value {
+            Field::Short(ShortField::Name) => Self::Name,
+            Field::Short(ShortField::Assignment) => Self::Assignment,
+            Field::Short(ShortField::DateSubmitted) => Self::DateSubmitted,
+            Field::Short(ShortField::CurrentGrade) => Self::CurrentGrade,
+            Field::Long(LongField::SubmissionField) => Self::SubmissionField,
+            Field::Long(LongField::Comments) => Self::Comments,
+            Field::Long(LongField::Files) => Self::Files,
+        }
+    }
+}
+
+impl From<ShortField> for error::Field {
+    fn from(value: ShortField) -> Self {
+        Field::from(value).into()
+    }
+}
+
+impl From<LongField> for error::Field {
+    fn from(value: LongField) -> Self {
+        Field::from(value).into()
+    }
+}
+
+/// The main parser struct responsible for pulling the pieces out of a datafile.
+///
+/// This struct keeps track of the currently-encountered pieces of the datafile as the main loop in the
+/// [`parse`][Self::parse] method does its loops through the lines of the file.
+pub struct DatafileParser<'a> {
+    names: Option<StudentNames<'a>>,
+    assignment: Option<&'a str>,
+    date_submitted: Option<NaiveDateTime>,
+    current_grade: Option<&'a str>,
+    submission_field: Option<&'a str>,
+    comments: Option<&'a str>,
+    files: Option<SmallVec<[FileNames<'a>; 8]>>,
+    source: &'a str,
+    stream: LineStream<'a>,
+}
+
+impl<'a> DatafileParser<'a> {
+    pub fn new(body: &'a str) -> Self {
+        Self {
+            names: None,
+            assignment: None,
+            date_submitted: None,
+            current_grade: None,
+            submission_field: None,
+            comments: None,
+            files: None,
+            source: body,
+            stream: LineStream::new(body),
+        }
+    }
+
+    fn err_duplicate_field<F: Into<error::Field>>(&self, field: F) -> DatafileError {
+        DatafileError::DuplicateField {
+            field: field.into(),
+            line_num: self.stream.line_num(),
+        }
+    }
+
+    fn err_field_parse<F: Into<error::Field>, E: Into<FieldParseError>>(&self, field: F, inner: E) -> DatafileError {
+        DatafileError::FieldParse {
+            field: field.into(),
+            inner: inner.into(),
+            line_num: self.stream.line_num(),
+        }
+    }
+
+    fn err_unknown_field(&self, field_name: &str) -> DatafileError {
+        DatafileError::UnknownField {
+            field: field_name.into(),
+            line_num: self.stream.line_num(),
+        }
+    }
+
+    fn err_unexpected(&self, text: &str) -> DatafileError {
+        DatafileError::Unexpected {
+            text: text.into(),
+            line_num: self.stream.line_num(),
+        }
+    }
+
+    fn err_missing<F: Into<error::Field>>(&self, field: F) -> DatafileError {
+        DatafileError::MissingField { field: field.into() }
+    }
+
+    fn has_value<F: Into<Field>>(&self, field: F) -> bool {
+        match field.into() {
+            Field::Short(ShortField::Name) => self.names.is_some(),
+            Field::Short(ShortField::Assignment) => self.assignment.is_some(),
+            Field::Short(ShortField::DateSubmitted) => self.date_submitted.is_some(),
+            Field::Short(ShortField::CurrentGrade) => self.current_grade.is_some(),
+            Field::Long(LongField::SubmissionField) => self.submission_field.is_some(),
+            Field::Long(LongField::Comments) => self.comments.is_some(),
+            Field::Long(LongField::Files) => self.files.is_some(),
+        }
+    }
+
+    pub fn parse(mut self) -> Result<DatafileInfo<'a>, DatafileError> {
+        while !self.stream.is_empty() {
+            let line = self.stream.current();
+
+            if line.trim().is_empty() {
+                self.stream.next();
+                continue;
+            }
+
+            match split_field_name(line) {
+                Some((field_name, field_body)) => match Field::from_str(field_name) {
+                    // Check for duplicate fields first:
+                    Some(field) if self.has_value(field) => return Err(self.err_duplicate_field(field)),
+                    // Now we can handle each field individually.
+                    Some(Field::Short(field)) => self.parse_short_field(field, field_body)?,
+                    Some(Field::Long(field)) => {
+                        // Each of the long fields start on the next line, which means the remainder of this line should
+                        // be empty.
+                        if !field_body.trim().is_empty() {
+                            return Err(self.err_unexpected(field_body));
+                        }
+
+                        // Additionally, there should be at least one more line afterwards. If not, we can break out of
+                        // the main loop now. Since each of these long sections are optional, our option-unwrapping down
+                        // below should handle this gracefully.
+                        if !self.stream.next() {
+                            break;
+                        }
+
+                        self.parse_long_field(field)?;
+                    },
+                    None => return Err(self.err_unknown_field(field_name)),
+                },
+                None => return Err(self.err_unexpected(line)),
+            }
+        }
+
+        // Required fields:
+        let names = self.names.ok_or(self.err_missing(error::Field::Name))?;
+        let assignment = self.assignment.ok_or(self.err_missing(error::Field::Assignment))?;
+        let date_submitted = self.date_submitted.ok_or(self.err_missing(error::Field::DateSubmitted))?;
+
+        // Optional/recoverable fields:
+        let current_grade = self.current_grade.filter(|&txt| txt != EMPTY_GRADES_FIELD);
+        let submission_field = self.submission_field.filter(|&txt| txt != EMPTY_SUBMISSION_FIELD);
+        let comments = self.comments.filter(|&txt| txt != EMPTY_COMMENTS_FIELD);
+        let files = self.files.unwrap_or(SmallVec::new());
+
+        Ok(DatafileInfo {
+            names,
+            assignment,
+            date_submitted,
+            current_grade,
+            submission_field,
+            comments,
+            files,
+        })
+    }
+
+    /// Parses a single-line field.
+    fn parse_short_field(&mut self, field: ShortField, field_body: &'a str) -> Result<(), DatafileError> {
+        match field {
+            ShortField::Name => {
+                self.names = match parse_names(field_body) {
+                    Ok(value) => Some(value),
+                    Err(inner) => return Err(self.err_field_parse(ShortField::Name, inner)),
+                };
+            },
+            ShortField::Assignment => {
+                self.assignment = Some(field_body);
+            },
+            ShortField::DateSubmitted => {
+                self.date_submitted = match NaiveDateTime::parse_from_str(field_body, SUBMISSION_DATE_FORMAT) {
+                    Ok(value) => Some(value),
+                    Err(inner) => return Err(self.err_field_parse(ShortField::DateSubmitted, inner)),
+                };
+            },
+            ShortField::CurrentGrade => {
+                self.current_grade = Some(field_body);
+            },
+        }
+
+        // Leave the stream in the right place for the next main loop iteration
+        self.stream.next();
+        Ok(())
+    }
+
+    /// Parses a multi-line field out of the parser's stream starting at its current position.
+    fn parse_long_field(&mut self, field: LongField) -> Result<(), DatafileError> {
+        match field {
+            LongField::SubmissionField => {
+                // To parse the 'Submission Field' section, we read lines until we see any of the other fields. We know
+                // that the field can only contain WYSIWYG HTML; that means that as soon as we see another 'XXX:' field,
+                // we know the 'Submission Field' is done.
+
+                let start_line = self.stream.current();
+                let mut end_line = start_line;
+
+                while self.stream.next() {
+                    let curr = self.stream.current();
+                    // Does this line have a field name on it? If so, break out. Otherwise, take note of this line as
+                    // being the last one of the section (as long as it's not a blank line, which will automatically
+                    // trim off trailing blanks).
+                    if split_field_name(curr).and_then(|(name, _)| Field::from_str(name)).is_some() {
+                        break;
+                    } else if !curr.trim().is_empty() {
+                        end_line = curr;
+                    }
+                }
+
+                // If we broke out of this loop, we either hit the name of another section, or we ran out of lines. We
+                // *don't* want to advance the stream after this point, since this will leave the stream's position
+                // sitting at the field to be re-handled by the main loop.
+                let i = subslice_offset_start(self.source, start_line).expect("start_line is derived from body");
+                let j = subslice_offset_end(self.source, end_line).expect("end_line is derived from body");
+                self.submission_field = Some(&self.source[i..j]);
+            },
+            LongField::Comments => {
+                // To parse the 'Comments' section, we want to greedily capture lines until we see another section.
+                // Keyword *greedily*: the (unfortunate) trick here is that 'Comments' contains *any* freeform text from
+                // the user. That means the user could theoretically put 'Name:' or 'Files:' at the start of the line
+                // inside their 'Comments'.
+                //
+                // To address this: when we do encounter a line that starts with "XXX:", then:
+                // - If we've already seen that `XXX` so far in the file before the 'Comments' section, then any "XXX:"
+                //   we see inside the comments must be a part of the comments' body.
+                // - If we haven't, then this instance of `XXX:` is part of the comments' body as long as it is not the
+                //   *last* instance of `XXX:` in the entire file.
+
+                let start_line = self.stream.current();
+                let mut end_line = start_line;
+
+                while self.stream.next() {
+                    let curr = self.stream.current();
+                    if let Some(field) = split_field_name(curr).and_then(|(name, _)| Field::from_str(name)) {
+                        // Has this field already been successfully parsed?
+                        if self.has_value(field) {
+                            end_line = curr;
+                        } else {
+                            // If not, then this line is included in the 'Comments:' body only if it is *not* the last
+                            // time this field appears in the file; otherwise, this current line is the start of another
+                            // section, and we want to stop. To test that, we'll clone the stream at its current
+                            // position and loop through the remainder of the lines up till the end.
+                            let mut test_stream = self.stream.clone();
+                            let mut found_again = false;
+                            while test_stream.next() {
+                                if split_field_name(test_stream.current())
+                                    .and_then(|(name, _)| Field::from_str(name))
+                                    .is_some_and(|test_field| test_field == field)
+                                {
+                                    found_again = true;
+                                    break;
+                                }
+                            }
+
+                            if found_again {
+                                end_line = curr;
+                            } else {
+                                break;
+                            }
+                        }
+                    } else if !curr.trim().is_empty() {
+                        end_line = curr;
+                    }
+                }
+
+                let i = subslice_offset_start(self.source, start_line).expect("start_line is derived from body");
+                let j = subslice_offset_end(self.source, end_line).expect("end_line is derived from body");
+                self.comments = Some(&self.source[i..j]);
+            },
+            LongField::Files => {
+                // To parse the 'Files' section, we want to keep grabbing lines as long as those lines look like
+                // 'Original filename: ...' or 'Filename: ...'. When we see a line that isn't one of those, we
+                // break and continue with the other sections.
+                match parse_files(&mut self.stream) {
+                    Ok(value) => self.files = Some(value),
+                    Err(inner) => return Err(self.err_field_parse(LongField::Files, inner)),
+                }
+            },
+        }
+
+        Ok(())
+    }
 }
 
 /// Splits a line of text at the first colon `:` character it sees and tidies up either side with some trimming.
 ///
 /// Returns an error if no `:` character is present, or if there is no text before the colon.
-fn split_field_name(line: &str) -> Result<(&str, &str), FieldError> {
-    let (name, body) = line.split_once(':').ok_or(FieldError::NoColon)?;
-
-    // Trim any spaces or tabs from the start of the field, but only remove at most a single space from the actual body
-    // (so that a field that actually starts with whitespace will be correctly returned).
-    let name = name.trim_start_matches(&[' ', '\t']);
+fn split_field_name(line: &str) -> Option<(&str, &str)> {
+    let (name, body) = line.split_once(':')?;
+    // Remove at most a single space from the actual body (so that a field that actually starts with whitespace will be
+    // correctly returned).
     let body = body.strip_prefix(' ').unwrap_or(body);
-
-    if name.is_empty() {
-        Err(FieldError::NoName)
-    } else {
-        Ok((name, body))
-    }
+    if name.trim().is_empty() { None } else { Some((name, body)) }
 }
 
-/// Reads the body of a Blackboard `.txt` datafile and extracts the metadata within.
-///
-/// Parsed values are returned as plain string slices into the original buffer to avoid an unnecessary allocations.
-pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, DatafileError> {
-    let mut lines = LineStream::new(body);
-
-    // Citing the robustness principle, we allow the first four fields to appear in any order. Ideally, we would allow
-    // *all* the fields to appear in any order. Unfortunately, we need to enforce that the latter three sections appear
-    // in a known order in order to accurately find the separation points between them.
-    let mut name_field = None;
-    let mut assignment_field = None;
-    let mut date_submitted_field = None;
-    let mut current_grade_field = None;
-
-    // Instead of looping exactly 4 times, we loop until we've found all four fields; that way we can skip over blank
-    // lines (again, trying to be "robust"). This loop will also break if any of the three larger sections (Submission
-    // Field, Comments, Files) are encountered.
-    while name_field.is_none()
-        || assignment_field.is_none()
-        || date_submitted_field.is_none()
-        || current_grade_field.is_none()
-    {
-        let line_num = lines.line_num();
-        let Some(line) = lines.peek_line() else {
-            // If we run out of lines before finding all four We want to return an error message that says which field
-            // we were currently looking for. We'll just report the first one in order that hasn't already been found.
-            let field = (name_field.is_none().then_some("'Name' field"))
-                .or_else(|| assignment_field.is_none().then_some("'Assignment' field"))
-                .or_else(|| date_submitted_field.is_none().then_some("'Date Submitted' field"))
-                .unwrap_or("'Current Grade' field");
-            return Err(DfErrorKind::EarlyEof(field).at_line(line_num));
-        };
-
-        // Skip over any blank lines:
-        if line.trim().is_empty() {
-            lines.move_next().expect("peek already returned Some");
-            continue;
-        }
-
-        let (field_name, contents) = split_field_name(line).map_err(|err| err.at_line(line_num))?;
-
-        let field = match field_name {
-            "Name" => &mut name_field,
-            "Assignment" => &mut assignment_field,
-            "Date Submitted" => &mut date_submitted_field,
-            "Current Grade" => &mut current_grade_field,
-            // If we encounter any of the other fields early, break out of the loop and let the logic afterwards handle
-            // any missing fields. whatever line gets left in the buffer. NB: Do this without advancing the stream: that
-            // way, if they get lucky and one of the optional fields is missing, the line will remain in the buffer and
-            // this function can proceed gracefully with trying to parse from there.
-            "Submission Field" | "Comments" | "Files" => break,
-            _ => return Err(DfErrorKind::UnknownField(field_name.to_string()).at_line(lines.line_num())),
-        };
-
-        if field.is_some() {
-            // [TODO] DuplicateField really could be holding a `&'static str`, since only the known valid field names
-            // could ever appear in here. But, that would mean re-organizing this loop to convert `field_name` into a
-            // static string upon matching, since it currently has lifetime 'a.
-            return Err(DfErrorKind::DuplicateField(field_name.to_string()).at_line(line_num));
-        } else {
-            *field = Some((contents, lines.line_num()));
-            lines.move_next();
-        }
-    }
-
-    let names = {
-        let (field, line_num) = name_field.ok_or(DfErrorKind::MissingField("Name").at_line(lines.line_num()))?;
-        let names = parse_names(field).map_err(|err| DfErrorKind::from(err).at_line(line_num))?;
-        names
-    };
-
-    let (assignment, _) = assignment_field.ok_or(DfErrorKind::MissingField("Assignment").at_line(lines.line_num()))?;
-
-    let date_submitted = {
-        let (field, line_num) =
-            date_submitted_field.ok_or(DfErrorKind::MissingField("Date Submitted").at_line(lines.line_num()))?;
-        NaiveDateTime::parse_from_str(field, SUBMISSION_DATE_FORMAT)
-            .map_err(|err| DfErrorKind::from(err).at_line(line_num))?
-    };
-
-    // We'll let 'Current Grade' be optional without throwing an error, again citing robustness principle.
-    let current_grade = current_grade_field.map(|(field, _)| field);
-
-    // Now we can move onto the three larger, block-level fields/sections.
-
-    // Skip over blank lines first (in a well-formed datafile, there should only ever be a single blank).
-    while let Some(line) = lines.peek_line()
-        && line.trim().is_empty()
-    {
-        lines.move_next();
-    }
-
-    // The next three depend on their ordering to parse properly. The first one should be the submission field.
-    let line = lines
-        .move_next()
-        .ok_or(DfErrorKind::EarlyEof("'Submission Field' section").at_line(lines.line_num()))?;
-    if line.trim_end() != "Submission Field:" {
-        let line_num = lines.line_num() - 1; // Since we just stepped forwards
-        return Err(DfErrorKind::Unexpected("Submission Field", line.to_string()).at_line(line_num));
-    }
-
-    // The 'Submission Field:' field does not have free-form text: instead, it has WYSIWYG-formatted HTML content.
-    // Importantly, that means that, under normal circumstances, it's impossible for a student to manage to get the text
-    // "Comments:" at the start of a line (any attempt to do so will place it inside of a `<p>` tag). That means that,
-    // no matter what content the student enters, we can reliably find the end of the 'Submission Field' field by
-    // searching for "Comments:" as long as we only check specifically the start of lines.
-
-    // We've already moved the stream past the end of the 'Submission Field:' line; the current start of the stream
-    // should be the start of the field. It would be an error for there to be no more lines, since that'd mean we have
-    // no 'Comments' or 'Files' section.
-    let sf_line1 = lines
-        .move_next()
-        .ok_or(DfErrorKind::EarlyEof("'Comments' section").at_line(lines.line_num()))?;
-
-    // To be more robust, what we actually want to search for is a blank line immediately followed by a "Comments:"
-    // line. So, as we scan forwards, we need to look for a sequence of three lines that looks like:
-    // ```
-    // ["<some text>", "", "Comments:"]
-    //  ^ oldest           ^ most recent
-    // ```
-    // To do that, we keep track of the last 3 lines we've seen, and then check them all as one (they're stored in
-    // reverse order so our if-lets read nicely, front-to-back).
-    let mut last3: [Option<&'a str>; 3] = [None, None, Some(sf_line1)];
-    let sf_last_line = loop {
-        let next_line = lines
-            .move_next()
-            .ok_or(DfErrorKind::EarlyEof("'Comments' section").at_line(lines.line_num()))?;
-
-        last3[0] = last3[1];
-        last3[1] = last3[2];
-        last3[2] = Some(next_line);
-
-        if let [_, Some(""), Some("Comments:")] = last3 {
-            // `last3[0]` should always be `Some` in the case of a well-formed datafile. The only way that the two most
-            // recent lines could be `["", "Comments:"]` *and* for the third-most recent to be `None` would be if the
-            // line right after 'Submission Field:' was the blank line before comments. We *could* throw an error in
-            // that case, but RE: robustness principle, we'll just treat it as the whole section being empty, same as if
-            // the "there is no submission data" message was there..
-            break last3[0].unwrap_or(sf_line1);
-        }
-    };
-
-    // Now use some pointer math to find out where the first line starts and the last line ends:
-    let sfi = subslice_offset_start(body, sf_line1).expect("sf_line1 is a substring of body");
-    let sfj = subslice_offset_end(body, sf_last_line).expect("sf_last_line is a substring of body");
-    let submission_field = &body[sfi..sfj];
-
-    // Once we have reached this point, the stream is sitting just beyond the 'Comments:' line (that's the only way the
-    // above loop could have broken, since the only other way out would be from the `?` checking for EOF).
-    //
-    // To parse the 'Comments:' section, we now want to grab lines greedily until the *last* occurrence of 'Files:',
-    // since Blackboard's auto-generated 'Files' section will always come after anything the user might have typed. To
-    // find the last one greedily, we have this last loop handle finding both the 'Comments' and 'Files' section, going
-    // all the way to the end.
-
-    let comments_line1 = lines
-        .move_next()
-        .ok_or(DfErrorKind::EarlyEof("'Files' section").at_line(lines.line_num()))?;
-
-    let mut comments_last_line = comments_line1;
-    let mut files_line1 = None;
-
-    // This time, since we want to simultaneously write down the last line of comments (two lines prior to the 'Files:'
-    // heading) and the first line of the Files (one line after the 'Files:' heading), we keep track of a window of four
-    // lines.
-    let mut last4: [Option<&'a str>; 4] = [None, None, None, Some(comments_line1)];
-    while let Some(next_line) = lines.move_next() {
-        last4[0] = last4[1];
-        last4[1] = last4[2];
-        last4[2] = last4[3];
-        last4[3] = Some(next_line);
-        if let [_, Some(""), Some("Files:"), _] = last4 {
-            // Take note of this as the potential last line of the comments, but keep scanning forwards till we hit the
-            // end. Once again, the only way for `last4[0]` to be None at this point would be if `comments_line1` had
-            // been the blank line between 'Comments:' and 'Files:'. Otherwise, at least 3 lines have been pushed to
-            // `last4`, and all the original `None`s are gone.
-            comments_last_line = last4[0].unwrap_or(comments_line1);
-
-            // Also keep track of the line number the files section started on, since we'll want to pass that along to
-            // the dedicated parser for the files section (so it can report error accurately). -1 because we just
-            // stepped forwards, we want the index of the line we just grabbed.
-            files_line1 = Some((next_line, lines.line_num() - 1));
-        }
-    }
-
-    // We've now hit the end of the file, and we should be good to pull out the last two sections.
-    let ci = subslice_offset_start(body, comments_line1).expect("comments_line1 is a substring of body");
-    let cj = subslice_offset_end(body, comments_last_line).expect("comments_last_line is a substring of body");
-    let comments = &body[ci..cj];
-
-    let files = match files_line1 {
-        // If `files_line1` is still None, that means we never saw a 'Files:' line with a blank line before it and
-        // another line after it. That means that either the datafile ended exactly at "Files:", or there was no
-        // "Files:" at all.
-        None => {
-            // A well-formed datafile will never *end* with "Files:", but we can be generous with our parsing and treat
-            // it as an empty section. If not even that happened, that means we hit EOF before finding our files
-            // section.
-            if let [_, _, Some(""), Some("Files:")] = last4 {
-                SmallVec::new()
-            } else {
-                return Err(DfErrorKind::EarlyEof("'Files' section").at_line(lines.line_num()));
-            }
-        },
-        Some((files_line1, start_line)) => {
-            // The body of the 'Files' section goes all the way to the end of the file.
-            let fi = subslice_offset_start(body, files_line1).expect("files_line1 is a substring of body");
-            let files = parse_files(&body[fi..], start_line)?;
-            files
-        },
-    };
-
-    Ok(DatafileInfo {
-        names,
-        assignment,
-        date_submitted,
-        current_grade: current_grade.filter(|&line| line != EMPTY_GRADES_FIELD),
-        submission_field: Some(submission_field).filter(|&text| text != EMPTY_SUBMISSION_FIELD),
-        comments: Some(comments).filter(|&text| text != EMPTY_COMMENTS_FIELD),
-        files,
-    })
-}
-
-fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, DfErrorKind> {
+fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, NameError> {
     // I'm *pretty sure* that student usernames can't have brackets in them, so finding a `(username)` at the end of the
     // line shouldn't require any counting of L/R parentheses. I have *no idea* if the students' actual names can have
     // brackets in them, though, so we'll sidestep that possibility by searching for the brackets from the end.
-    let i = field.rfind('(').ok_or(NameFieldError::MissingL)?;
+    let i = field.rfind('(').ok_or(NameError::MissingL)?;
 
     // Search for closing bracket only after the opening bracket:
-    let j = field[i + 1..].rfind(')').ok_or(NameFieldError::MissingR)?;
+    let j = field[i + 1..].rfind(')').ok_or(NameError::MissingR)?;
 
     let fullname = field[..i].trim();
     let username = field[i + 1..i + j].trim();
 
     if fullname.is_empty() {
-        return Err(NameFieldError::EmptyFullname.into());
+        return Err(NameError::EmptyFullname);
     } else if username.is_empty() {
-        return Err(NameFieldError::EmptyUsername.into());
+        return Err(NameError::EmptyUsername);
     }
 
     Ok(StudentNames { fullname, username })
 }
 
-fn parse_files<'a>(body: &'a str, start_line: usize) -> Result<SmallVec<[FileNames<'a>; 8]>, DatafileError> {
-    if body == EMPTY_FILES_FIELD {
-        return Ok(SmallVec::new());
+fn parse_files<'a>(stream: &mut LineStream<'a>) -> Result<SmallVec<[FileNames<'a>; 8]>, FilesError> {
+    // Once again, it's convenient to have access to the data we're building up through the `self`.
+    struct FilesParser<'a> {
+        files: SmallVec<[FileNames<'a>; 8]>,
+        original_name: Option<&'a str>,
+        archive_name: Option<&'a str>,
     }
 
-    let mut lines = LineStream::new_at_line(body, start_line);
-    let mut files = SmallVec::new();
-
-    let mut original_name = None;
-    let mut archive_name = None;
-
-    while let Some(line) = lines.move_next() {
-        let line_num = lines.line_num() - 1; // Since we just stepped
-        if line.trim().is_empty() {
-            continue;
+    impl<'a> FilesParser<'a> {
+        fn new() -> Self {
+            FilesParser {
+                files: SmallVec::new(),
+                original_name: None,
+                archive_name: None,
+            }
         }
 
-        // NB: `split_field_name` will trim the name.
-        let (field_name, filename) = split_field_name(line).map_err(|err| err.at_line(line_num))?;
-        match (field_name, original_name, archive_name) {
-            ("Original filename", None, _) => original_name = Some(filename),
-            ("Filename", _, None) => archive_name = Some(filename),
-            // If we encounter a second "Original filename" before first encountering a "Filename", or a second
-            // "Filename" before first encountering an "Original filename", then we missed a field.
-            ("Original filename", Some(_), None) => return Err(FilesSectionError::DuplicateOriginal.at_line(line_num)),
-            ("Filename", None, Some(_)) => return Err(FilesSectionError::DuplicateZipped.at_line(line_num)),
-            (_other, _, _) => return Err(FilesSectionError::UnknownField(field_name.to_string()).at_line(line_num)),
+        fn handle_line(&mut self, line: &'a str) -> Result<ControlFlow<()>, FilesError> {
+            // Since the 'Files' section has further parsing to do, we need to check for the special "No files" text
+            // here instead of at the end.
+            if line == EMPTY_FILES_FIELD {
+                return Ok(ControlFlow::Break(()));
+            } else if line.trim().is_empty() {
+                return Ok(ControlFlow::Continue(()));
+            }
+
+            let Some((field, filename)) = split_field_name(line) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+
+            match (field, self.original_name, self.archive_name) {
+                ("Original filename", None, _) => self.original_name = Some(filename),
+                ("Filename", _, None) => self.archive_name = Some(filename),
+                // If we encounter a second "Original filename" before first encountering a "Filename", or a second
+                // "Filename" before first encountering an "Original filename", then we missed a field.
+                ("Original filename", Some(_), None) => return Err(FilesError::MissingArchive),
+                ("Filename", None, Some(_)) => return Err(FilesError::MissingOriginal),
+                // Any field we find that is not "Original filename" or "Filename" is totally okay, it just means we
+                // want to break out of the loop.
+                (_, _, _) => return Ok(ControlFlow::Break(())),
+            }
+
+            if let (Some(original), Some(archive)) = (self.original_name, self.archive_name) {
+                self.files.push(FileNames { original, archive });
+                self.original_name = None;
+                self.archive_name = None;
+            }
+
+            Ok(ControlFlow::Continue(()))
         }
 
-        if let (Some(original), Some(zipped)) = (original_name, archive_name) {
-            files.push(FileNames { original, zipped });
-            original_name = None;
-            archive_name = None;
+        fn finish(mut self) -> Result<SmallVec<[FileNames<'a>; 8]>, FilesError> {
+            match (self.original_name, self.archive_name) {
+                (Some(original), Some(archive)) => {
+                    self.files.push(FileNames { original, archive });
+                    self.original_name = None;
+                    self.archive_name = None;
+                },
+                (Some(_), None) => return Err(FilesError::MissingArchive),
+                (None, Some(_)) => return Err(FilesError::MissingOriginal),
+                (None, None) => {},
+            }
+            Ok(self.files)
         }
     }
 
-    Ok(files)
+    let mut parser = FilesParser::new();
+
+    while !stream.is_empty() {
+        // Lines in the 'Files' section start with tabs.
+        let line = stream.current().trim_start_matches(&[' ', '\t']);
+        match parser.handle_line(line)? {
+            ControlFlow::Continue(_) => {
+                stream.next();
+            },
+            ControlFlow::Break(_) => {
+                break;
+            },
+        }
+    }
+
+    parser.finish()
 }
 
-/// An "iterator" that yields lines from a text buffer and gives access to the current line number.
+/// An almost-iterator that steps through lines from a text buffer and gives access to the current line number.
 ///
-/// This struct is more or less equivalent to a `std::iter::Peekable<std::iter::Enumerate<std::str::Lines<'a>>>`. The
-/// only difference is that it provides more convenient access to the current line number. Using a standard `Enumerate`
-/// iterator means we can only access the line number by stepping; we can wrap it in a peekable, but then the line
-/// number is always behind `peek()` which returns an `Option`. In our case, we want to be able to grab the current line
-/// number for error reporting, even if the iterator is already exhausted.
+/// This struct is functionally similar to a [`std::str::Lines`] wrapped in an [`Enumerate`] and [`Peekable`], but it
+/// provides more purpose-built and explicit control for when exactly the stream is advanced. Using a standard
+/// `Enumerate<Lines>` would mean that the current line number (which we want for error-reporting inside
+/// [`DatafileParser`]) is only accessible when stepping forwards. Wrapping it in a `Peekable` helps, but then the line
+/// number is always behind `peek()`, which returns an `Option`. For the most control when parsing, it is convenient to
+/// have precise control of when the lines are advanced.
+///
+/// [`Enumerate`]: std::iter::Enumerate
+/// [`Peekable`]: std::iter::Peekable
+#[derive(Clone)]
 struct LineStream<'a> {
     /// The remaining portion of the buffer.
     buf: &'a str,
@@ -389,62 +553,50 @@ impl<'a> LineStream<'a> {
         }
     }
 
-    /// Creates a new [`LineStream`] whose line number counter starts at the given value.
-    ///
-    /// This can be used to create a new `LineStream` out of a substring of a larger original buffer while still keeping
-    /// the line numbers correct with respect to the original buffer.
-    pub fn new_at_line(buf: &'a str, start_line: usize) -> Self {
-        LineStream {
-            buf,
-            next_eol: buf.find('\n').unwrap_or(buf.len()),
-            line_num: start_line,
-        }
-    }
-
-    /// Gets a reference to the remaining contents of the buffer.
-    pub fn buf_remaining(&self) -> &'a str {
-        self.buf
+    /// Returns `true` if there are no more lines in this stream.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 
     /// Gets the current line number of this stream.
     ///
-    /// This number is merely a counter and should only be used for reporting purposes; it may not accurately reflect
-    /// the amount of lines in the original buffer that was used to create this `LineStream`.
+    /// If the stream has been exhausted, this number will point to one past the last line number.
     pub fn line_num(&self) -> usize {
         self.line_num
     }
 
     /// Returns the current line in the stream, excluding the line terminator.
-    pub fn peek_line(&self) -> Option<&'a str> {
-        if self.buf.is_empty() {
-            None
-        } else {
-            // Since `next_eol` is the index of the `\n`, we don't need to chop it off here. But we do need to handle a
-            // potential `\r` from CRLF.
-            let line = &self.buf[..self.next_eol];
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            Some(line)
-        }
+    ///
+    /// If the stream is currently empty, this will return an empty string. Note however that an empty string will also
+    /// be returned if the stream contains an empty line; check [`Self::is_empty`] or the return value of [`Self::next`]
+    /// when stepping to determine if the stream is truly empty or not.
+    pub fn current(&self) -> &'a str {
+        // `next_eol` is the index of the `\n` itself, so don't need to chop it off here. We do need to handle a
+        // potential `\r` from CRLF, though.
+        let line = &self.buf[..self.next_eol];
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        line
     }
 
-    /// Returns the current line in the stream and advances the stream's buffer onto the next line.
+    /// Advances the stream to the next line and increments the line counter.
     ///
-    /// The returned line does not include the line terminator.
-    pub fn move_next(&mut self) -> Option<&'a str> {
-        if self.buf.is_empty() {
-            None
+    /// Returns `true` if there is still at least one line left in the buffer after advancing.
+    ///
+    /// Does nothing if the stream is already empty.
+    pub fn next(&mut self) -> bool {
+        if self.is_empty() {
+            false
         } else {
-            // Here, instead of slicing *up to* `next_eol`, we're splitting *at* `next_eol`. That means the remainder
-            // will include the `\n` (unless we split right at the end of the string).
-            let (line, rest) = self.buf.split_at(self.next_eol);
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let rest = rest.strip_prefix('\n').unwrap_or(line);
-
-            self.buf = rest;
-            self.next_eol = rest.find('\n').unwrap_or(rest.len());
             self.line_num += 1;
-
-            Some(line)
+            if self.next_eol < self.buf.len() {
+                self.buf = &self.buf[self.next_eol + 1..]; // Skip past `\n`
+                self.next_eol = self.buf.find('\n').unwrap_or(self.buf.len());
+                true // At least one more line
+            } else {
+                self.buf = &self.buf[self.next_eol..]; // Advance all the way up to the end
+                self.next_eol = self.buf.len();
+                false // No more lines
+            }
         }
     }
 }

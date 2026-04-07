@@ -9,7 +9,7 @@ mod gradebook;
 use std::io::{Read, Seek};
 
 use self::gradebook::GradebookParser;
-use crate::error::GradebookLoadError;
+use self::error::GradebookLoadError;
 use crate::{GradebookInfo, ZipArchive};
 
 /// Attempts to parse the contents of a [`ZipArchive`] into a [`GradebookInfo`].
