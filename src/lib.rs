@@ -1,12 +1,13 @@
-mod parse;
-
 use std::io::{Read, Seek};
 
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
 pub use zip::read::ZipArchive;
 
-pub use crate::parse::error::GradebookLoadError;
+pub use crate::error::GradebookLoadError;
+
+pub mod error;
+mod parse;
 
 /// A rich representation of a gradebook file downloaded from Blackboard.
 ///
@@ -53,7 +54,7 @@ pub struct AttemptInfo {
     /// When this attempt was submitted.
     datetime: NaiveDateTime,
     /// Any text that the student provided in the "Text Submission" field on Blackboard's interface.
-    text_sub: Option<String>,
+    text_submission: Option<String>,
     /// Any comments provided by the student when submitting.
     comments: Option<String>,
     /// The current grade for this attempt, if applicable.

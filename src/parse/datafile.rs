@@ -3,8 +3,7 @@ use std::ops::ControlFlow;
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
 
-use super::error::DatafileError;
-use super::error::datafile::{self as error, FieldParseError, FilesError, NameError};
+use crate::error::datafile::{self as error, DatafileError, FieldParseError, FilesError, NameError};
 
 /// The format specifier used to parse datetimes out of datafiles' `Date Submitted:` lines.
 ///
@@ -63,6 +62,10 @@ pub struct StudentNames<'a> {
 pub struct FileNames<'a> {
     original: &'a str,
     archive: &'a str,
+}
+
+pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, DatafileError> {
+    DatafileParser::new(body).parse()
 }
 
 /// The name of a field parsed out of a datafile.
@@ -149,7 +152,7 @@ impl From<LongField> for error::Field {
 ///
 /// This struct keeps track of the currently-encountered pieces of the datafile as the main loop in the
 /// [`parse`][Self::parse] method does its loops through the lines of the file.
-pub struct DatafileParser<'a> {
+struct DatafileParser<'a> {
     names: Option<StudentNames<'a>>,
     assignment: Option<&'a str>,
     date_submitted: Option<NaiveDateTime>,

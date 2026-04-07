@@ -1,39 +1,36 @@
-pub use datafile::DatafileError;
-pub use gradebook::GradebookLoadError;
+use std::io;
 
-pub mod gradebook {
-    use std::io;
+use zip::result::ZipError;
 
-    use zip::result::ZipError;
+/// An error that occurs when attempting to load Gradebook information from a zip file.
+#[derive(Debug, thiserror::Error)]
+pub enum GradebookLoadError {
+    #[error("IO error occurred reading from zip file: {0}")]
+    IO(#[from] io::Error),
 
-    use super::datafile::DatafileError;
+    #[error("failed to open zip file: {0}")]
+    ZipOpen(ZipError),
 
-    /// An error that occurs when attempting to load Gradebook information from a zip file.
-    #[derive(Debug, thiserror::Error)]
-    pub enum GradebookLoadError {
-        #[error("IO error occurred reading from zip file: {0}")]
-        IO(#[from] io::Error),
+    #[error("failed to parse {filename}: {inner}")]
+    Datafile {
+        filename: String,
+        inner: datafile::DatafileError,
+    },
 
-        #[error("failed to open zip file: {0}")]
-        ZipOpen(ZipError),
+    #[error("gradebook contains no submissions")]
+    Empty,
+}
 
-        #[error("failed to parse {filename}: {inner}")]
-        Datafile { filename: String, inner: DatafileError },
-
-        #[error("gradebook contains no submissions")]
-        Empty,
-    }
-
-    impl From<ZipError> for GradebookLoadError {
-        fn from(value: ZipError) -> Self {
-            match value {
-                ZipError::Io(err) => Self::IO(err),
-                err => Self::ZipOpen(err),
-            }
+impl From<ZipError> for GradebookLoadError {
+    fn from(value: ZipError) -> Self {
+        match value {
+            ZipError::Io(err) => Self::IO(err),
+            err => Self::ZipOpen(err),
         }
     }
 }
 
+/// Errors and types related specifically the parsing of Blackboard's "datafiles."
 pub mod datafile {
     use std::fmt::Display;
 
