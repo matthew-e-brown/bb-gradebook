@@ -13,3 +13,5 @@ regex = "1.12.2"
 chrono = "0.4.43"
 thiserror = "2.0.17"
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
+smallvec = "1.15.1"
+hashbrown = { version = "0.16.1", default-features = false, features = ["inline-more"]}

@@ -1,12 +1,13 @@
 mod cli;
 
 use std::error::Error;
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::process::ExitCode;
 
-use bb_gradebook::Gradebook;
+use bb_gradebook::GradebookArchive;
 
 fn main() -> ExitCode {
     let args = cli::Args::parse();
@@ -20,8 +21,8 @@ fn main() -> ExitCode {
 }
 
 
-fn open_gradebook(path: &Path) -> Result<Gradebook<impl Read + Seek>, Box<dyn Error>> {
+fn open_gradebook(path: &Path) -> Result<GradebookArchive<impl Read + Seek + Debug>, Box<dyn Error>> {
     let file = BufReader::new(File::open(path)?);
-    let book = Gradebook::from_reader(file)?;
+    let book = GradebookArchive::from_reader(file)?;
     Ok(book)
 }
