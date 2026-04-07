@@ -1,0 +1,15 @@
+[package]
+name = "bb-gradebook-cli"
+description = "Neatly extracts student submissions from zip files downloaded from Blackboard."
+authors = ["Matthew Brown <matthew.e.brown.17@gmail.com>"]
+version = "0.2.0"
+edition = "2024"
+
+[[bin]]
+name = "bb-gradebook"
+path = "src/main.rs"
+
+[dependencies]
+bb-gradebook = { path = "../bb-gradebook" }
+thiserror = "2.0.17"
+clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
