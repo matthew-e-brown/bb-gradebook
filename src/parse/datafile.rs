@@ -427,7 +427,7 @@ fn parse_names<'a>(field: &'a str) -> Result<StudentNames<'a>, NameError> {
     let j = field[i + 1..].rfind(')').ok_or(NameError::MissingR)?;
 
     let fullname = field[..i].trim();
-    let username = field[i + 1..i + j].trim();
+    let username = field[i + 1..i + 1 + j].trim();
 
     if fullname.is_empty() {
         return Err(NameError::EmptyFullname);
