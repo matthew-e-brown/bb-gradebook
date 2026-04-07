@@ -1,4 +1,5 @@
 use std::io::{Read, Seek};
+use std::ops::Range;
 
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
@@ -59,8 +60,8 @@ pub struct AttemptInfo {
     comments: Option<String>,
     /// The current grade for this attempt, if applicable.
     current_grade: Option<String>,
-    /// A list of indices into [`GradebookInfo::files`] for all the [`FileInfo`] attached to this attempt.
-    files: SmallVec<[usize; 8]>,
+    /// A range of indices inside of [`GradebookInfo::files`] for all the [`FileInfo`] attached to this attempt.
+    files: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,10 @@ impl<R: Read + Seek> GradebookArchive<R> {
         let mut archive = ZipArchive::new(reader)?;
         let info = GradebookInfo::from_archive(&mut archive)?;
         Ok(Self { archive, info })
+    }
+
+    pub fn info(&self) -> &GradebookInfo {
+        &self.info
     }
 }
 

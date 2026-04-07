@@ -40,28 +40,28 @@ const EMPTY_FILES_FIELD: &str = "No files were attached to this submission.";
 /// Struct containing all the captured pieces of text from a Blackboard datafile.
 #[derive(Debug)]
 pub struct DatafileInfo<'a> {
-    names: StudentNames<'a>,
-    assignment: &'a str,
-    date_submitted: NaiveDateTime,
-    current_grade: Option<&'a str>,
-    submission_field: Option<&'a str>,
-    comments: Option<&'a str>,
-    files: SmallVec<[FileNames<'a>; 8]>,
+    pub names: StudentNames<'a>,
+    pub assignment: &'a str,
+    pub date_submitted: NaiveDateTime,
+    pub current_grade: Option<&'a str>,
+    pub submission_field: Option<&'a str>,
+    pub comments: Option<&'a str>,
+    pub files: SmallVec<[FileNames<'a>; 8]>,
 }
 
 /// Struct for the captured text in the `Name: Fullname (username)` line in a datafile.
 #[derive(Debug, Clone, Copy)]
 pub struct StudentNames<'a> {
-    fullname: &'a str,
-    username: &'a str,
+    pub fullname: &'a str,
+    pub username: &'a str,
 }
 
 /// Struct for the captured text in the `Original Filename: ...` and `Filename: ...` lines of the `Files:` section in a
 /// datafile.
 #[derive(Debug, Clone, Copy)]
 pub struct FileNames<'a> {
-    original: &'a str,
-    archive: &'a str,
+    pub original: &'a str,
+    pub archive: &'a str,
 }
 
 pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, DatafileError> {

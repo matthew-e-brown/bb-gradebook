@@ -17,6 +17,9 @@ pub enum GradebookLoadError {
         inner: datafile::DatafileError,
     },
 
+    #[error("submission {datafile} specified a filename not present in zip file: {filename}")]
+    FileNotFound { datafile: String, filename: String },
+
     #[error("gradebook contains no submissions")]
     Empty,
 }

@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     println!("{:#?}", args);
 
     let gradebook = open_gradebook(args.path()).unwrap();
-    println!("{:#?}", gradebook);
+    println!("{:#?}", gradebook.info());
 
     ExitCode::SUCCESS
 }

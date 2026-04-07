@@ -9,6 +9,7 @@ use std::io::{Read, Seek};
 use hashbrown::HashTable;
 use smallvec::SmallVec;
 
+use self::datafile::DatafileInfo;
 use crate::error::GradebookLoadError;
 use crate::{AttemptInfo, FileInfo, GradebookInfo, StudentInfo, ZipArchive};
 
@@ -58,26 +59,87 @@ impl GradebookParser {
 
         let mut df_buffer = String::new(); // Re-use the same buffer for all files
         for df_index in datafiles {
+            // Indices from `find_datafiles` are safe to unwrap since they came right from
             df_buffer.clear();
-            archive.by_index(df_index)?.read_to_string(&mut df_buffer)?;
+            archive.by_index(df_index).unwrap().read_to_string(&mut df_buffer)?;
 
-            // [TODO] Don't cancel the entire thing over one bad datafile; find some way to gracefully collect failed
-            // datafile parses elsewhere and report them separately.
-            let datafile = match datafile::parse_datafile(&df_buffer) {
+            let DatafileInfo {
+                names,
+                assignment: assignment_name,
+                date_submitted,
+                current_grade,
+                submission_field,
+                comments,
+                files,
+            } = match datafile::parse_datafile(&df_buffer) {
                 Ok(info) => info,
                 Err(err) => {
-                    let filename = archive
-                        .name_for_index(df_index)
-                        .expect("df_index is already known to be valid")
-                        .to_owned();
+                    // [TODO] Don't cancel the entire thing over one bad datafile; find some way to gracefully collect
+                    // failed datafile parses elsewhere and report them separately.
+                    let filename = archive.name_for_index(df_index).unwrap().to_owned();
                     return Err(GradebookLoadError::Datafile { filename, inner: err });
                 },
             };
 
-            println!("Parsed datafile:\n{:#?}\n", datafile);
+            // Each new datafile is a new attempt, so we know this index without needing to check anything; but the
+            // student's index might be re-used. For files, all the files we're about to push will live contiguously
+            // starting right after the current set of files we're storing, so we can use a range (unless we're not
+            // pushing *any* files).
+            let attempt_index = self.attempts.len();
+            let student_index = self.get_or_create_student(names.fullname, names.username);
+            let files_range = (files.len() > 0).then_some(self.files.len()..self.files.len() + files.len());
+
+            self.students[student_index].attempts.push(attempt_index);
+
+            self.attempts.push(AttemptInfo {
+                student: student_index,
+                datetime: date_submitted,
+                text_submission: submission_field.map(str::to_owned),
+                comments: comments.map(str::to_owned),
+                current_grade: current_grade.map(str::to_owned),
+                files: files_range,
+            });
+
+            for filenames in files {
+                let zip_index = match archive.index_for_name(filenames.archive) {
+                    Some(index) => index,
+                    None => {
+                        let datafile = archive.name_for_index(df_index).unwrap().to_owned();
+                        let filename = filenames.archive.to_owned();
+                        return Err(GradebookLoadError::FileNotFound { datafile, filename });
+                    },
+                };
+
+                let zipfile = archive.by_index(zip_index).unwrap();
+                self.files.push(FileInfo {
+                    attempt: attempt_index,
+                    zip_index,
+                    original_name: filenames.original.to_owned(),
+                    archive_name: filenames.archive.to_owned(),
+                    size_zipped: zipfile.compressed_size(),
+                    size_unzipped: zipfile.size(),
+                });
+            }
+
+            // Finally, write down the assignment name if we don't have it already.
+            if self.assignment_name.is_none() {
+                self.assignment_name = Some(assignment_name.to_string());
+            }
         }
 
-        todo!();
+        // [NOTE] Will have to change this unwrap once addressing the `TODO` up there, since it will then be possible to
+        // get down this far without having exited the function. But in that case, we can just make "all datafiles
+        // failed" be an error case; then this unwrap will be in a different branch.
+        let assignment_name = self
+            .assignment_name
+            .expect("at least one datafile has been successfully parsed");
+
+        Ok(GradebookInfo {
+            assignment_name,
+            students: self.students,
+            attempts: self.attempts,
+            files: self.files,
+        })
     }
 
     fn get_or_create_student(&mut self, fullname: &str, username: &str) -> usize {
@@ -126,17 +188,24 @@ fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<usize> {
     // file has a dot. Dots are is `U+002E`; underscores are `U+005F`. So, if we sort the list of filenames
     // lexicographically, the dot will always be first!
 
+    // [FIXME] Hmm... One problem I've just noticed. This new algorithm doesn't actually verify that the filenames are
+    // actually valid datafile names! You can feed it any random zip file, and it'll try and interpret its contents as
+    // if it was a Blackboard gradebook file... So maybe it would be wise to bring back a (less strict) regex to
+    // validate that the filenames do actually match.
+
     let mut datafiles = Vec::new();
 
     if archive.len() > 0 {
-        let mut files = archive.file_names().collect::<Vec<_>>();
-        files.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut files = (0..archive.len())
+            .map(|index| (index, archive.name_for_index(index).expect("index is between 0 and length")))
+            .collect::<Vec<_>>();
+        files.sort_unstable_by(|(_, a), (_, b)| a.as_bytes().cmp(b.as_bytes()));
         let mut files = files.into_iter();
 
         // The first file is guaranteed to be a datafile, since (a) there is at least one 1 submission, (b) all
         // submissions have a datafile, and (c) each submission's datafile will be lexicographically before its others.
-        let first_df = files.next().unwrap();
-        datafiles.push(archive.index_for_name(first_df).unwrap());
+        let (first_idx, first_df) = files.next().unwrap();
+        datafiles.push(first_idx);
 
         // To find where the next submission starts, we loop through the list of files, skipping them as long as they
         // share a common prefix with the most recent datafile. Specifically, a common prefix with a length equal to
@@ -145,12 +214,12 @@ fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<usize> {
         // `<timestamp>` section, and therefore belong to different submissions; `curr` marks the start of the next
         // submission, and is therefore a datafile.
         let mut prev = first_df;
-        while let Some(curr) = files.next() {
+        while let Some((index, curr)) = files.next() {
             let s1 = prev.as_bytes().into_iter();
             let s2 = curr.as_bytes().into_iter();
             let prefix_len = s1.zip(s2).take_while(|(a, b)| a == b).count();
             if prefix_len < prev.len() - ".txt".len() {
-                datafiles.push(archive.index_for_name(curr).unwrap());
+                datafiles.push(index);
                 prev = curr;
             }
         }
