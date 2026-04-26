@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use chrono::NaiveDateTime;
 use smallvec::SmallVec;
 
-use crate::error::datafile::{self as error, DatafileError, FieldParseError, FilesError, NameError};
+use self::error::{FilesError, InvalidFieldError, NameError, ParseError};
 
 /// The format specifier used to parse datetimes out of datafiles' `Date Submitted:` lines.
 ///
@@ -64,8 +64,94 @@ pub struct FileNames<'a> {
     pub archive: &'a str,
 }
 
-pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, DatafileError> {
+pub fn parse_datafile<'a>(body: &'a str) -> Result<DatafileInfo<'a>, ParseError> {
     DatafileParser::new(body).parse()
+}
+
+/// Errors related specifically to the parsing of `.txt` datafiles.
+pub(crate) mod error {
+    use std::fmt::Display;
+
+    /// An error that occurs when failing to parse one of Blackboard's `.txt` "datafiles".
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum ParseError {
+        #[error("duplicate field '{field}' on line {line_num}")]
+        DuplicateField { field: Field, line_num: usize },
+
+        #[error("failed to parse field '{field}' on line {line_num}: {inner}")]
+        FieldParse {
+            field: Field,
+            inner: InvalidFieldError,
+            line_num: usize,
+        },
+
+        #[error("unexpected text at line {line_num}: `{text}`")]
+        Unexpected { text: Box<str>, line_num: usize },
+
+        #[error("unknown field '{field}'")]
+        UnknownField { field: Box<str>, line_num: usize },
+
+        #[error("field '{field}' not found")]
+        MissingField { field: Field },
+    }
+
+    /// The field in the datafile at which an error occurred.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Field {
+        Name,
+        Assignment,
+        DateSubmitted,
+        CurrentGrade,
+        SubmissionField,
+        Comments,
+        Files,
+    }
+
+    impl Display for Field {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Field::Name => "Name",
+                Field::Assignment => "Assignment",
+                Field::DateSubmitted => "Date Submitted",
+                Field::CurrentGrade => "Current Grade",
+                Field::SubmissionField => "Submission Field",
+                Field::Comments => "Comments",
+                Field::Files => "Files",
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, thiserror::Error)]
+    #[error(transparent)]
+    pub enum InvalidFieldError {
+        Name(#[from] NameError),
+        DateSubmitted(#[from] chrono::ParseError),
+        Files(#[from] FilesError),
+    }
+
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum NameError {
+        #[error("expected '(' around username")]
+        MissingL,
+
+        #[error("expected ')' around username")]
+        MissingR,
+
+        #[error("student's name is missing")]
+        EmptyFullname,
+
+        #[error("student's username is missing")]
+        EmptyUsername,
+    }
+
+    #[derive(Debug, Clone, thiserror::Error)]
+    pub enum FilesError {
+        #[error("file is missing an 'Original filename' field")]
+        MissingOriginal,
+
+        #[error("file is missing a 'Filename' field")]
+        MissingArchive,
+    }
 }
 
 /// The name of a field parsed out of a datafile.
@@ -179,37 +265,37 @@ impl<'a> DatafileParser<'a> {
         }
     }
 
-    fn err_duplicate_field<F: Into<error::Field>>(&self, field: F) -> DatafileError {
-        DatafileError::DuplicateField {
+    fn err_duplicate_field<F: Into<error::Field>>(&self, field: F) -> ParseError {
+        ParseError::DuplicateField {
             field: field.into(),
             line_num: self.stream.line_num(),
         }
     }
 
-    fn err_field_parse<F: Into<error::Field>, E: Into<FieldParseError>>(&self, field: F, inner: E) -> DatafileError {
-        DatafileError::FieldParse {
+    fn err_field_parse<F: Into<error::Field>, E: Into<InvalidFieldError>>(&self, field: F, inner: E) -> ParseError {
+        ParseError::FieldParse {
             field: field.into(),
             inner: inner.into(),
             line_num: self.stream.line_num(),
         }
     }
 
-    fn err_unknown_field(&self, field_name: &str) -> DatafileError {
-        DatafileError::UnknownField {
+    fn err_unknown_field(&self, field_name: &str) -> ParseError {
+        ParseError::UnknownField {
             field: field_name.into(),
             line_num: self.stream.line_num(),
         }
     }
 
-    fn err_unexpected(&self, text: &str) -> DatafileError {
-        DatafileError::Unexpected {
+    fn err_unexpected(&self, text: &str) -> ParseError {
+        ParseError::Unexpected {
             text: text.into(),
             line_num: self.stream.line_num(),
         }
     }
 
-    fn err_missing<F: Into<error::Field>>(&self, field: F) -> DatafileError {
-        DatafileError::MissingField { field: field.into() }
+    fn err_missing<F: Into<error::Field>>(&self, field: F) -> ParseError {
+        ParseError::MissingField { field: field.into() }
     }
 
     fn has_value<F: Into<Field>>(&self, field: F) -> bool {
@@ -224,7 +310,7 @@ impl<'a> DatafileParser<'a> {
         }
     }
 
-    pub fn parse(mut self) -> Result<DatafileInfo<'a>, DatafileError> {
+    pub fn parse(mut self) -> Result<DatafileInfo<'a>, ParseError> {
         while !self.stream.is_empty() {
             let line = self.stream.current();
 
@@ -284,7 +370,7 @@ impl<'a> DatafileParser<'a> {
     }
 
     /// Parses a single-line field.
-    fn parse_short_field(&mut self, field: ShortField, field_body: &'a str) -> Result<(), DatafileError> {
+    fn parse_short_field(&mut self, field: ShortField, field_body: &'a str) -> Result<(), ParseError> {
         match field {
             ShortField::Name => {
                 self.names = match parse_names(field_body) {
@@ -312,7 +398,7 @@ impl<'a> DatafileParser<'a> {
     }
 
     /// Parses a multi-line field out of the parser's stream starting at its current position.
-    fn parse_long_field(&mut self, field: LongField) -> Result<(), DatafileError> {
+    fn parse_long_field(&mut self, field: LongField) -> Result<(), ParseError> {
         match field {
             LongField::SubmissionField => {
                 // To parse the 'Submission Field' section, we read lines until we see any of the other fields. We know

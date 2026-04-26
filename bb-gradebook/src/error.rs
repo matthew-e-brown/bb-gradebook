@@ -1,119 +1,76 @@
+use std::fmt::Debug;
 use std::io;
 
 use zip::result::ZipError;
 
-/// An error that occurs when attempting to load Gradebook information from a zip file.
+use crate::parse::DatafileError;
+
+/// An error that occurs when attempting to read Gradebook information from a `.zip` file.
 #[derive(Debug, thiserror::Error)]
-pub enum GradebookLoadError {
-    #[error("IO error occurred reading from zip file: {0}")]
-    IO(#[from] io::Error),
+pub enum Error {
+    #[error("i/o error occurred reading from zip file: {0}")]
+    IO(#[source] io::Error),
 
     #[error("failed to open zip file: {0}")]
-    ZipOpen(ZipError),
+    ZipOpen(#[source] ZipError),
 
+    #[error(transparent)]
+    InvalidGradebook(#[from] GradebookError),
+}
+
+impl From<io::Error> for Error {
+    fn from(inner: io::Error) -> Self {
+        Error::IO(inner)
+    }
+}
+
+/// An error that occurs when a valid Gradebook cannot be parsed from a `.zip` file.
+#[derive(thiserror::Error)]
+#[error(transparent)]
+pub struct GradebookError(Box<GradebookErrorRepr>);
+
+impl Debug for GradebookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+
+impl GradebookError {
+    pub(super) fn datafile(filename: &str, inner: DatafileError) -> Self {
+        Self::from(GradebookErrorRepr::InvalidDatafile { filename: filename.into(), inner })
+    }
+
+    pub(super) fn bad_filename(datafile_name: &str, bad_filename: &str) -> Self {
+        Self::from(GradebookErrorRepr::BadFileReference {
+            datafile: datafile_name.into(),
+            filename: bad_filename.into(),
+        })
+    }
+
+    pub(super) fn empty() -> Self {
+        Self::from(GradebookErrorRepr::EmptyGradebook)
+    }
+}
+
+impl From<GradebookErrorRepr> for GradebookError {
+    fn from(inner: GradebookErrorRepr) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
+/// Private inner representation of [`GradebookError`].
+#[derive(Debug, thiserror::Error)]
+enum GradebookErrorRepr {
     #[error("failed to parse {filename}: {inner}")]
-    Datafile {
-        filename: String,
-        inner: datafile::DatafileError,
+    InvalidDatafile {
+        filename: Box<str>,
+        #[source]
+        inner: DatafileError,
     },
 
-    #[error("submission {datafile} specified a filename not present in zip file: {filename}")]
-    FileNotFound { datafile: String, filename: String },
+    #[error("submission {datafile} referenced a filename not found in zip file: {filename}")]
+    BadFileReference { datafile: Box<str>, filename: Box<str> },
 
     #[error("gradebook contains no submissions")]
-    Empty,
-}
-
-impl From<ZipError> for GradebookLoadError {
-    fn from(value: ZipError) -> Self {
-        match value {
-            ZipError::Io(err) => Self::IO(err),
-            err => Self::ZipOpen(err),
-        }
-    }
-}
-
-/// Errors and types related specifically the parsing of Blackboard's "datafiles."
-pub mod datafile {
-    use std::fmt::Display;
-
-    #[derive(Debug, Clone, thiserror::Error)]
-    pub enum DatafileError {
-        #[error("duplicate field '{field}' on line {line_num}")]
-        DuplicateField { field: Field, line_num: usize },
-
-        #[error("failed to parse field '{field}' on line {line_num}: {inner}")]
-        FieldParse {
-            field: Field,
-            inner: FieldParseError,
-            line_num: usize,
-        },
-
-        #[error("unexpected text at line {line_num}: `{text}`")]
-        Unexpected { text: Box<str>, line_num: usize },
-
-        #[error("unknown field '{field}'")]
-        UnknownField { field: Box<str>, line_num: usize },
-
-        #[error("field '{field}' not found")]
-        MissingField { field: Field },
-    }
-
-    /// The field at which an error occurred.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum Field {
-        Name,
-        Assignment,
-        DateSubmitted,
-        CurrentGrade,
-        SubmissionField,
-        Comments,
-        Files,
-    }
-
-    impl Display for Field {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(match self {
-                Field::Name => "Name",
-                Field::Assignment => "Assignment",
-                Field::DateSubmitted => "Date Submitted",
-                Field::CurrentGrade => "Current Grade",
-                Field::SubmissionField => "Submission Field",
-                Field::Comments => "Comments",
-                Field::Files => "Files",
-            })
-        }
-    }
-
-    #[derive(Debug, Clone, thiserror::Error)]
-    #[error(transparent)]
-    pub enum FieldParseError {
-        Name(#[from] NameError),
-        DateSubmitted(#[from] chrono::ParseError),
-        Files(#[from] FilesError),
-    }
-
-    #[derive(Debug, Clone, thiserror::Error)]
-    pub enum NameError {
-        #[error("expected '(' around username")]
-        MissingL,
-
-        #[error("expected ')' around username")]
-        MissingR,
-
-        #[error("student's name is missing")]
-        EmptyFullname,
-
-        #[error("student's username is missing")]
-        EmptyUsername,
-    }
-
-    #[derive(Debug, Clone, thiserror::Error)]
-    pub enum FilesError {
-        #[error("file is missing an 'Original filename' field")]
-        MissingOriginal,
-
-        #[error("file is missing a 'Filename' field")]
-        MissingArchive,
-    }
+    EmptyGradebook,
 }

@@ -3,10 +3,10 @@ use std::ops::Range;
 
 use smallvec::SmallVec;
 
-pub use crate::error::GradebookLoadError;
+pub use crate::error::Error;
 
 pub mod error;
-mod parse;
+pub mod parse;
 
 /// Re-export of [`zip::ZipArchive`], used as the source for a [`GradebookArchive`].
 pub use zip::ZipArchive;
@@ -83,13 +83,13 @@ pub struct FileInfo {
 
 impl<R: Read + Seek> GradebookArchive<R> {
     /// Creates a new [`ZipArchive`] over the given reader and parses its contents as a Blackboard gradebook.
-    pub fn from_reader(reader: R) -> Result<Self, GradebookLoadError> {
-        let archive = ZipArchive::new(reader)?;
+    pub fn from_reader(reader: R) -> Result<Self, Error> {
+        let archive = ZipArchive::new(reader).map_err(Error::ZipOpen)?;
         Self::from_archive(archive)
     }
 
     /// Parses a [`ZipArchive`]'s contents as a Blackboard gradebook.
-    pub fn from_archive(mut archive: ZipArchive<R>) -> Result<Self, GradebookLoadError> {
+    pub fn from_archive(mut archive: ZipArchive<R>) -> Result<Self, Error> {
         let info = GradebookInfo::from_archive(&mut archive)?;
         Ok(Self { archive, info })
     }
@@ -138,13 +138,13 @@ impl<R: Read + Seek> GradebookArchive<R> {
 
 impl GradebookInfo {
     /// Creates a new [`ZipArchive`] over the given reader and parses its contents as a Blackboard gradebook.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<GradebookInfo, GradebookLoadError> {
-        let mut archive = ZipArchive::new(reader)?;
+    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<GradebookInfo, Error> {
+        let mut archive = ZipArchive::new(reader).map_err(Error::ZipOpen)?;
         Self::from_archive(&mut archive)
     }
 
     /// Parses a [`ZipArchive`]'s contents as a Blackboard gradebook.
-    pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<GradebookInfo, GradebookLoadError> {
+    pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<GradebookInfo, Error> {
         parse::parse_gradebook(archive)
     }
 

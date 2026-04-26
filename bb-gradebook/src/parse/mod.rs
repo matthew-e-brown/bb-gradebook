@@ -10,13 +10,14 @@ use hashbrown::HashTable;
 use smallvec::SmallVec;
 
 use self::datafile::DatafileInfo;
-use crate::error::GradebookLoadError;
+pub use self::datafile::error::ParseError as DatafileError;
+use crate::error::{Error, GradebookError};
 use crate::{AttemptInfo, FileInfo, GradebookInfo, StudentInfo, ZipArchive};
 
 mod datafile;
 
 /// Attempts to parse the contents of a [`ZipArchive`] into a [`GradebookInfo`].
-pub fn parse_gradebook<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<GradebookInfo, GradebookLoadError> {
+pub fn parse_gradebook<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<GradebookInfo, Error> {
     GradebookParser::new().parse(archive)
 }
 
@@ -44,10 +45,10 @@ impl GradebookParser {
         }
     }
 
-    pub fn parse<R: Read + Seek>(mut self, archive: &mut ZipArchive<R>) -> Result<GradebookInfo, GradebookLoadError> {
+    pub fn parse<R: Read + Seek>(mut self, archive: &mut ZipArchive<R>) -> Result<GradebookInfo, Error> {
         let datafiles = find_datafiles(&archive);
         if datafiles.len() == 0 {
-            return Err(GradebookLoadError::Empty);
+            return Err(GradebookError::empty().into());
         }
 
         // There may be fewer students than attempts, but it's probably a good enough default; we can shrink it at the
@@ -76,8 +77,8 @@ impl GradebookParser {
                 Err(err) => {
                     // [TODO] Don't cancel the entire thing over one bad datafile; find some way to gracefully collect
                     // failed datafile parses elsewhere and report them separately.
-                    let filename = archive.name_for_index(df_index).unwrap().to_owned();
-                    return Err(GradebookLoadError::Datafile { filename, inner: err });
+                    let filename = archive.name_for_index(df_index).unwrap();
+                    return Err(GradebookError::datafile(filename, err).into());
                 },
             };
 
@@ -104,9 +105,9 @@ impl GradebookParser {
                 let zip_index = match archive.index_for_name(filenames.archive) {
                     Some(index) => index,
                     None => {
-                        let datafile = archive.name_for_index(df_index).unwrap().to_owned();
-                        let filename = filenames.archive.to_owned();
-                        return Err(GradebookLoadError::FileNotFound { datafile, filename });
+                        let datafile = archive.name_for_index(df_index).unwrap();
+                        let filename = filenames.archive;
+                        return Err(GradebookError::bad_filename(datafile, filename).into());
                     },
                 };
 
