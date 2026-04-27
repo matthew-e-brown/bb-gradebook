@@ -46,10 +46,7 @@ impl GradebookParser {
     }
 
     pub fn parse<R: Read + Seek>(mut self, archive: &mut ZipArchive<R>) -> Result<GradebookInfo, Error> {
-        let datafiles = find_datafiles(&archive);
-        if datafiles.len() == 0 {
-            return Err(GradebookError::empty().into());
-        }
+        let datafiles = find_datafiles(&archive)?;
 
         // There may be fewer students than attempts, but it's probably a good enough default; we can shrink it at the
         // end if we need to. Likewise, there will likely be more files than there are attempts, but it feels like a
@@ -163,72 +160,121 @@ impl GradebookParser {
     }
 }
 
-/// Inspects the list of files in a gradebook archive and figures out which ones are Blackboard's auto-generated `txt`
-/// files (**datafiles**).
+/// Inspects the list of files in a [`ZipArchive`] to determine which ones are Blackboard's auto-generated `txt` files
+/// (**datafiles**).
 ///
 /// Returns a vector containing the indices of the datafiles in the archive. Use this with [`ZipArchive::by_index`] to
-/// actually access the files.
-fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<usize> {
-    // --- APPROACH ---
-    //
-    // Every gradebook file contains a series of auto-generated `.txt` files that give metadata on each assignment.
-    // These data files are our ticket to reliably determining information about the submissions without having to rely
-    // on trying to parse that information from filenames, which would be messy and fragile.
-    //
-    // Every filename in the gradebook looks like: `<dropbox>_<username>_attempt_<datetime>_<original-filename>`. The
-    // datafiles can be identified because they lack the `<original-filename>` section, and instead just end with a
-    // `.txt` extension. Attempting to find these files by regex-matching on `_attempt_<datetime>.txt$` is tempting, but
-    // error-prone.
-    //
-    // We want some other way to differentiate between:
-    //
-    // - `<dropbox>_<username>_attempt_<timestamp>.txt`
-    // - `<dropbox>_<username>_attempt_<timestamp>_<filename>.<ext>`
-    //
-    // Key observation: no matter what the student names their file, it will have an underscore where the Blackboard
-    // file has a dot. Dots are is `U+002E`; underscores are `U+005F`. So, if we sort the list of filenames
-    // lexicographically, the dot will always be first!
-
-    // [FIXME] Hmm... One problem I've just noticed. This new algorithm doesn't actually verify that the filenames are
-    // actually valid datafile names! You can feed it any random zip file, and it'll try and interpret its contents as
-    // if it was a Blackboard gradebook file... So maybe it would be wise to bring back a (less strict) regex to
-    // validate that the filenames do actually match.
+/// actually access the files. Indices are returned in place of filenames to avoid keeping a borrow on the `ZipArchive`,
+/// which would prevent pulling files out (since accessing files requires a mutable reference).
+///
+/// # Approach
+///
+/// Every gradebook file contains a series of auto-generated `.txt` files that give metadata on each assignment. These
+/// "datafiles" are our ticket to reliably determining information about the submissions without having to rely on
+/// trying to parse that information out of the filenames, which would be messy and fragile.
+///
+/// Every filename in the gradebook looks like: `<dropbox>_<username>_attempt_<datetime>_<original-filename>`. The
+/// datafiles can be identified because they lack the `<original-filename>` section, and instead end with just a `.txt`.
+/// Attempting to find these files by regex-matching on `_attempt_yyyy-mm-dd-HH-MM-SS.txt$` is tempting, but
+/// error-prone. While unlikely, a student _could_ technically submit a file that ends with `_attempt_<datetime>.txt`,
+/// which would break the whole thing.
+///
+/// We want some other way to differentiate between Blackboard's datafiles and the things the students submit. Something
+/// that relies on the inherent structure of the zip file. Thankfully, a solution becomes somewhat obvious when viewing
+/// the list of files sorted alphabetically:
+///
+/// - `<dropbox>_<bob>_attempt_<timestamp>.txt`
+/// - `<dropbox>_<bob>_attempt_<timestamp>_<filename>.<ext>`
+/// - `<dropbox>_<alice>_attempt_<timestamp>.txt`
+/// - `<dropbox>_<alice>_attempt_<timestamp>_<filename>.<ext>`
+///
+/// Key observation: no matter what the student names their file, it will have an underscore in its name in the same
+/// position its associated datafile has a dot. Dots are `U+002E`; underscores are `U+005F`. So, if we sort the list of
+/// filenames lexicographically (alphabetically), the dot will always be first! That means that, after sorting, the
+/// first file in the list will always be a datafile. Additionally, all the files for each attempt will be right up
+/// against one another, since they'll all share a common prefix. Then, to find the start of each subsequent submission,
+/// we loop through the list of files, skipping them as long as they share a common prefix with the most recent
+/// datafile.
+fn find_datafiles<R: Read + Seek>(archive: &ZipArchive<R>) -> Result<Vec<usize>, GradebookError> {
+    if archive.len() == 0 {
+        return Err(GradebookError::empty());
+    }
 
     let mut datafiles = Vec::new();
 
-    if archive.len() > 0 {
-        let mut files = (0..archive.len())
-            .map(|index| (index, archive.name_for_index(index).expect("index is between 0 and length")))
-            .collect::<Vec<_>>();
-        files.sort_unstable_by(|(_, a), (_, b)| a.as_bytes().cmp(b.as_bytes()));
-        let mut files = files.into_iter();
+    // Get the list of all filenames and sort them
+    let mut files = {
+        let mut vec = (0..archive.len())
+            .map(|index| (index, archive.name_for_index(index).expect("index is between 0 and len()")))
+            .collect::<Vec<(usize, &str)>>();
+        vec.sort_unstable_by(|(_, name1), (_, name2)| name1.as_bytes().cmp(name2.as_bytes()));
+        vec.into_iter()
+    };
 
-        // The first file is guaranteed to be a datafile, since (a) there is at least one 1 submission, (b) all
-        // submissions have a datafile, and (c) each submission's datafile will be lexicographically before its others.
-        let (first_idx, first_df) = files.next().unwrap();
-        datafiles.push(first_idx);
-
-        // To find where the next submission starts, we loop through the list of files, skipping them as long as they
-        // share a common prefix with the most recent datafile. Specifically, a common prefix with a length equal to
-        // `prev.len() - ".txt".len()`. This is the longest common prefix there could possibly be with a datafile. If
-        // the current file's prefix length is *shorter* than that, it means they differ somewhere before the end of the
-        // `<timestamp>` section, and therefore belong to different submissions; `curr` marks the start of the next
-        // submission, and is therefore a datafile.
-        let mut prev = first_df;
-        while let Some((index, curr)) = files.next() {
-            let s1 = prev.as_bytes().into_iter();
-            let s2 = curr.as_bytes().into_iter();
-            let prefix_len = s1.zip(s2).take_while(|(a, b)| a == b).count();
-            if prefix_len < prev.len() - ".txt".len() {
-                datafiles.push(index);
-                prev = curr;
-            }
-        }
-
-        // Now that we've found all the datafiles, sort the indices so they come out in the original order of the zip
-        // file (which are sorted by submission time, not by student username).
-        datafiles.sort_unstable();
+    // Again, the first file is guaranteed to be a datafile... if this zip actually contains datafiles, that is!
+    let (first_idx, first_df) = files.next().unwrap();
+    if !is_valid_datafile_name(&first_df) {
+        // If it doesn't start with a valid datafile, this probably isn't actually a gradebook.
+        return Err(GradebookError::not_a_gradebook());
     }
 
-    datafiles
+    datafiles.push(first_idx);
+
+    // Now loop through the list of files and look for a common prefix with the most recent datafile. Specifically, a
+    // common prefix with a length equal to `prev.len() - ".txt".len()`. This is the longest common prefix there could
+    // possibly be with a datafile. If the current file's prefix length is *shorter* than that, it means they differ
+    // somewhere before the end of the `<timestamp>` section, and therefore belong to different submissions; `curr`
+    // is therefore the datafile at the start of the next submission.
+    let mut prev = first_df;
+    while let Some((index, curr)) = files.next() {
+        let prev_bytes = prev.as_bytes().into_iter();
+        let curr_bytes = curr.as_bytes().into_iter();
+        let prefix_len = prev_bytes.zip(curr_bytes).take_while(|(a, b)| a == b).count();
+        if prefix_len < prev.len() - ".txt".len() {
+            // New datafile! Just make sure it's actually a datafile...
+            if is_valid_datafile_name(curr) {
+                datafiles.push(index);
+                prev = curr;
+            } else {
+                return Err(GradebookError::not_a_gradebook());
+            }
+        }
+    }
+
+    Ok(datafiles)
+}
+
+fn is_valid_datafile_name(name: &str) -> bool {
+    // Every valid datafile name should look like this:
+    //
+    // ```
+    // _attempt_YYYY-MM-DD-hh-mm-ss.txt
+    // 0         1         2         3
+    // 01234567890123456789012345678901
+    // ```
+    //
+    // There are a bunch of magic numbers in this function: this diagram is their reference.
+    // This is way faster than compiling and running an entire heap-allocated regex.
+    if name.len() >= 32 {
+        let end_string = &name[name.len() - 32..];
+        let end_bytes = end_string.as_bytes();
+
+        let is_number_in_range = |s: &str, min, max| s.parse::<usize>().is_ok_and(|n| min <= n && n <= max);
+
+        &end_bytes[28..32] == b".txt"
+            && &end_bytes[0..9] == b"_attempt_"
+            && end_bytes[13] == b'-'
+            && end_bytes[16] == b'-'
+            && end_bytes[19] == b'-'
+            && end_bytes[22] == b'-'
+            && end_bytes[25] == b'-'
+            && is_number_in_range(&end_string[09..13], 1, 9999) // Year
+            && is_number_in_range(&end_string[14..16], 1, 12) // Month
+            && is_number_in_range(&end_string[17..19], 1, 31) // Day
+            && is_number_in_range(&end_string[20..22], 0, 23) // Hour
+            && is_number_in_range(&end_string[23..25], 0, 59) // Minute
+            && is_number_in_range(&end_string[26..28], 0, 59) // Second
+    } else {
+        false
+    }
 }

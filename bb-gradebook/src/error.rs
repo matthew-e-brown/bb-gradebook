@@ -27,15 +27,21 @@ impl From<io::Error> for Error {
 /// An error that occurs when a valid Gradebook cannot be parsed from a `.zip` file.
 #[derive(thiserror::Error)]
 #[error(transparent)]
-pub struct GradebookError(Box<GradebookErrorRepr>);
+pub struct GradebookError {
+    repr: Box<GradebookErrorRepr>,
+}
 
 impl Debug for GradebookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(&self.0, f)
+        Debug::fmt(&self.repr, f)
     }
 }
 
 impl GradebookError {
+    pub(super) fn not_a_gradebook() -> Self {
+        Self::from(GradebookErrorRepr::NotAGradebook)
+    }
+
     pub(super) fn datafile(filename: &str, inner: DatafileError) -> Self {
         Self::from(GradebookErrorRepr::InvalidDatafile { filename: filename.into(), inner })
     }
@@ -54,13 +60,16 @@ impl GradebookError {
 
 impl From<GradebookErrorRepr> for GradebookError {
     fn from(inner: GradebookErrorRepr) -> Self {
-        Self(Box::new(inner))
+        Self { repr: Box::new(inner) }
     }
 }
 
 /// Private inner representation of [`GradebookError`].
 #[derive(Debug, thiserror::Error)]
 enum GradebookErrorRepr {
+    #[error("zip archive is not a valid gradebook: failed to find a valid Blackboard .txt datafile")]
+    NotAGradebook,
+
     #[error("failed to parse {filename}: {inner}")]
     InvalidDatafile {
         filename: Box<str>,
